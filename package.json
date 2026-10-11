@@ -1,0 +1,21 @@
+{
+  "name": "resp-kv-store",
+  "version": "1.0.0",
+  "description": "Zero-dependency in-memory Key-Value storage engine compatible with RESP protocol over TCP sockets in TypeScript",
+  "type": "module",
+  "scripts": {
+    "start": "node --experimental-strip-types src/index.ts",
+    "test": "node --experimental-strip-types --test tests/resp.test.ts tests/storage.test.ts tests/skiplist.test.ts tests/polymorphic.test.ts tests/aof.test.ts tests/transactions.test.ts tests/pubsub.test.ts tests/integration.test.ts tests/replication.test.ts tests/blocking.test.ts tests/eviction.test.ts tests/rdb.test.ts tests/streams.test.ts tests/scan.test.ts tests/slowlog.test.ts tests/bitmap.test.ts tests/hll.test.ts",
+    "bench": "node --experimental-strip-types benchmarks/bench.ts"
+  },
+  "keywords": [
+    "redis",
+    "resp",
+    "key-value",
+    "storage-engine",
+    "systems-engineering",
+    "zero-dependencies"
+  ],
+  "author": "",
+  "license": "MIT"
+}

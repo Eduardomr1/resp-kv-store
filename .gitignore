@@ -1,0 +1,15 @@
+# Dependencies
+node_modules/
+
+# Runtime persistence dumps & logs
+*.rdb
+*.aof
+dump.rdb
+appendonly.aof
+*.log
+
+# OS & Editor artifacts
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
