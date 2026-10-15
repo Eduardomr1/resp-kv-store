@@ -4,7 +4,7 @@ import { RESPParser, ProtocolError } from './resp/parser.ts';
 import { RESPSerializer, RESP_CONSTANTS } from './resp/serializer.ts';
 import type { RESPValue } from './resp/types.ts';
 import { StorageEngine } from './storage/engine.ts';
-import { WrongTypeError, type SetOptions } from './storage/types.ts';
+import { WrongTypeError, type SetOptions, type GetExOptions } from './storage/types.ts';
 import type { StreamEntry } from './storage/stream.ts';
 import { OOMError, type EvictionPolicy } from './eviction/types.ts';
 import { RDBEncoder } from './storage/rdb.ts';
@@ -40,6 +40,7 @@ export class TCPServer {
   private host: string;
   private rdbFilePath: string;
   private isRunning: boolean = false;
+  private lastCommandMutated: boolean = false;
 
   constructor(options: ServerOptions = {}) {
     this.port = options.port ?? 6379;
@@ -194,8 +195,9 @@ export class TCPServer {
   }
 
   private static readonly WRITE_COMMANDS = new Set([
-    'SET', 'DEL', 'HSET', 'HDEL', 'LPUSH', 'RPUSH', 'LPOP', 'RPOP',
-    'SADD', 'SREM', 'ZADD', 'ZREM', 'EXPIRE', 'PEXPIRE', 'PERSIST',
+    'SET', 'MSET', 'MSETNX', 'INCR', 'INCRBY', 'DECR', 'DECRBY', 'APPEND', 'GETDEL', 'GETEX',
+    'DEL', 'HSET', 'HDEL', 'LPUSH', 'RPUSH', 'LPOP', 'RPOP',
+    'SADD', 'SREM', 'ZADD', 'ZREM', 'EXPIRE', 'PEXPIRE', 'EXPIREAT', 'PEXPIREAT', 'PERSIST',
     'FLUSHALL', 'FLUSHDB', 'XADD', 'SETBIT', 'BITOP', 'PFADD', 'PFMERGE'
   ]);
 
@@ -209,6 +211,12 @@ export class TCPServer {
     }
     if (commandName === 'DEL' || commandName === 'EXISTS') {
       for (let i = 1; i < args.length; i++) {
+        this.transactions.touchKey((args[i] as any).value.toString('utf8'));
+      }
+      return;
+    }
+    if (commandName === 'MSET' || commandName === 'MSETNX') {
+      for (let i = 1; i < args.length; i += 2) {
         this.transactions.touchKey((args[i] as any).value.toString('utf8'));
       }
       return;
@@ -277,8 +285,9 @@ export class TCPServer {
         commandName,
         args.map((a: any) => a.value),
         () => {
+          this.lastCommandMutated = TCPServer.WRITE_COMMANDS.has(commandName);
           const res = this.dispatchCommand(commandName, args, socket, session) ?? RESP_CONSTANTS.OK;
-          if (res && TCPServer.WRITE_COMMANDS.has(commandName) && res[0] !== 0x2d) {
+          if (res && this.lastCommandMutated && res[0] !== 0x2d) {
             this.replication.propagate(RESPSerializer.encodeArray(args));
             this.touchKeysForCommand(commandName, args);
           }
@@ -288,14 +297,12 @@ export class TCPServer {
       return RESP_CONSTANTS.QUEUED;
     }
 
+    this.lastCommandMutated = TCPServer.WRITE_COMMANDS.has(commandName);
     const result = this.dispatchCommand(commandName, args, socket, session);
-    if (result && TCPServer.WRITE_COMMANDS.has(commandName)) {
+    if (result && this.lastCommandMutated) {
       if (result.length > 0 && result[0] !== 0x2d) {
-        const isNullBulk = result.length === 5 && result.toString() === '$-1\r\n';
-        if (!isNullBulk) {
-          this.replication.propagate(RESPSerializer.encodeArray(args));
-          this.touchKeysForCommand(commandName, args);
-        }
+        this.replication.propagate(RESPSerializer.encodeArray(args));
+        this.touchKeysForCommand(commandName, args);
       }
     }
     return result;
@@ -416,26 +423,66 @@ export class TCPServer {
           const key = args[1].value.toString('utf8');
           const val = args[2].value;
           const options: SetOptions = {};
+          let returnOld = false;
+          let ttlFlagCount = 0;
 
           for (let i = 3; i < args.length; i++) {
             const opt = (args[i] as any).value?.toString('utf8').toUpperCase();
-            if (opt === 'NX') options.nx = true;
-            else if (opt === 'XX') options.xx = true;
-            else if (opt === 'KEEPTTL') options.keepttl = true;
-            else if (opt === 'EX' && i + 1 < args.length) {
+            if (opt === 'NX') {
+              if (options.xx) return RESPSerializer.encodeError('syntax error');
+              options.nx = true;
+            } else if (opt === 'XX') {
+              if (options.nx) return RESPSerializer.encodeError('syntax error');
+              options.xx = true;
+            } else if (opt === 'GET') {
+              returnOld = true;
+            } else if (opt === 'KEEPTTL') {
+              ttlFlagCount++;
+              options.keepttl = true;
+            } else if (opt === 'EX' && i + 1 < args.length) {
+              ttlFlagCount++;
               const sec = Number((args[++i] as any).value?.toString('utf8'));
-              if (isNaN(sec)) return RESPSerializer.encodeError('value is not an integer or out of range');
+              if (!Number.isInteger(sec) || sec <= 0) {
+                return RESPSerializer.encodeError("invalid expire time in 'set' command");
+              }
               options.ex = sec;
             } else if (opt === 'PX' && i + 1 < args.length) {
+              ttlFlagCount++;
               const ms = Number((args[++i] as any).value?.toString('utf8'));
-              if (isNaN(ms)) return RESPSerializer.encodeError('value is not an integer or out of range');
+              if (!Number.isInteger(ms) || ms <= 0) {
+                return RESPSerializer.encodeError("invalid expire time in 'set' command");
+              }
               options.px = ms;
+            } else if (opt === 'EXAT' && i + 1 < args.length) {
+              ttlFlagCount++;
+              const sec = Number((args[++i] as any).value?.toString('utf8'));
+              if (!Number.isInteger(sec) || sec <= 0) {
+                return RESPSerializer.encodeError("invalid expire time in 'set' command");
+              }
+              options.exat = sec;
+            } else if (opt === 'PXAT' && i + 1 < args.length) {
+              ttlFlagCount++;
+              const ms = Number((args[++i] as any).value?.toString('utf8'));
+              if (!Number.isInteger(ms) || ms <= 0) {
+                return RESPSerializer.encodeError("invalid expire time in 'set' command");
+              }
+              options.pxat = ms;
             } else {
               return RESPSerializer.encodeError(`syntax error near '${opt}'`);
             }
           }
 
+          if (ttlFlagCount > 1) {
+            return RESPSerializer.encodeError('syntax error');
+          }
+
+          const oldValue = returnOld ? this.engine.get(key) : null;
           const success = this.engine.set(key, val, options);
+          this.lastCommandMutated = success;
+
+          if (returnOld) {
+            return RESPSerializer.encodeBulkString(oldValue);
+          }
           if (options.nx || options.xx) {
             return success ? RESP_CONSTANTS.OK : RESP_CONSTANTS.NULL_BULK;
           }
@@ -456,6 +503,169 @@ export class TCPServer {
           }
           const keys = args.slice(1).map((a: any) => a.value.toString('utf8'));
           return RESPSerializer.encodeArray(this.engine.mget(keys));
+        }
+
+        case 'MSET': {
+          if (args.length < 3 || (args.length - 1) % 2 !== 0) {
+            return RESPSerializer.encodeError("wrong number of arguments for 'mset' command");
+          }
+          const pairs: Array<[string, Buffer]> = [];
+          for (let i = 1; i < args.length; i += 2) {
+            pairs.push([(args[i] as any).value.toString('utf8'), (args[i + 1] as any).value]);
+          }
+          this.engine.mset(pairs);
+          return RESP_CONSTANTS.OK;
+        }
+
+        case 'MSETNX': {
+          if (args.length < 3 || (args.length - 1) % 2 !== 0) {
+            return RESPSerializer.encodeError("wrong number of arguments for 'msetnx' command");
+          }
+          const pairs: Array<[string, Buffer]> = [];
+          for (let i = 1; i < args.length; i += 2) {
+            pairs.push([(args[i] as any).value.toString('utf8'), (args[i + 1] as any).value]);
+          }
+          const ok = this.engine.msetnx(pairs);
+          this.lastCommandMutated = ok;
+          return RESPSerializer.encodeInteger(ok ? 1 : 0);
+        }
+
+        case 'INCR': {
+          if (args.length !== 2) {
+            return RESPSerializer.encodeError("wrong number of arguments for 'incr' command");
+          }
+          try {
+            const val = this.engine.incr((args[1] as any).value.toString('utf8'));
+            return RESPSerializer.encodeInteger(val);
+          } catch (err: any) {
+            if (err instanceof WrongTypeError || err instanceof OOMError) throw err;
+            return RESPSerializer.encodeError(err.message);
+          }
+        }
+
+        case 'INCRBY': {
+          if (args.length !== 3) {
+            return RESPSerializer.encodeError("wrong number of arguments for 'incrby' command");
+          }
+          try {
+            const key = (args[1] as any).value.toString('utf8');
+            const inc = (args[2] as any).value.toString('utf8');
+            const val = this.engine.incrby(key, inc);
+            return RESPSerializer.encodeInteger(val);
+          } catch (err: any) {
+            if (err instanceof WrongTypeError || err instanceof OOMError) throw err;
+            return RESPSerializer.encodeError(err.message);
+          }
+        }
+
+        case 'DECR': {
+          if (args.length !== 2) {
+            return RESPSerializer.encodeError("wrong number of arguments for 'decr' command");
+          }
+          try {
+            const val = this.engine.decr((args[1] as any).value.toString('utf8'));
+            return RESPSerializer.encodeInteger(val);
+          } catch (err: any) {
+            if (err instanceof WrongTypeError || err instanceof OOMError) throw err;
+            return RESPSerializer.encodeError(err.message);
+          }
+        }
+
+        case 'DECRBY': {
+          if (args.length !== 3) {
+            return RESPSerializer.encodeError("wrong number of arguments for 'decrby' command");
+          }
+          try {
+            const key = (args[1] as any).value.toString('utf8');
+            const dec = (args[2] as any).value.toString('utf8');
+            const val = this.engine.decrby(key, dec);
+            return RESPSerializer.encodeInteger(val);
+          } catch (err: any) {
+            if (err instanceof WrongTypeError || err instanceof OOMError) throw err;
+            return RESPSerializer.encodeError(err.message);
+          }
+        }
+
+        case 'APPEND': {
+          if (args.length !== 3) {
+            return RESPSerializer.encodeError("wrong number of arguments for 'append' command");
+          }
+          const key = (args[1] as any).value.toString('utf8');
+          const val = (args[2] as any).value;
+          return RESPSerializer.encodeInteger(this.engine.append(key, val));
+        }
+
+        case 'STRLEN': {
+          if (args.length !== 2) {
+            return RESPSerializer.encodeError("wrong number of arguments for 'strlen' command");
+          }
+          const key = (args[1] as any).value.toString('utf8');
+          return RESPSerializer.encodeInteger(this.engine.strlen(key));
+        }
+
+        case 'GETDEL': {
+          if (args.length !== 2) {
+            return RESPSerializer.encodeError("wrong number of arguments for 'getdel' command");
+          }
+          const key = (args[1] as any).value.toString('utf8');
+          const val = this.engine.getdel(key);
+          this.lastCommandMutated = val !== null;
+          return RESPSerializer.encodeBulkString(val);
+        }
+
+        case 'GETEX': {
+          if (args.length < 2) {
+            return RESPSerializer.encodeError("wrong number of arguments for 'getex' command");
+          }
+          const key = (args[1] as any).value.toString('utf8');
+          const opts: GetExOptions = {};
+          let optCount = 0;
+
+          for (let i = 2; i < args.length; i++) {
+            const opt = (args[i] as any).value?.toString('utf8').toUpperCase();
+            if (opt === 'PERSIST') {
+              optCount++;
+              opts.persist = true;
+            } else if (opt === 'EX' && i + 1 < args.length) {
+              optCount++;
+              const sec = Number((args[++i] as any).value?.toString('utf8'));
+              if (!Number.isInteger(sec) || sec <= 0) {
+                return RESPSerializer.encodeError("invalid expire time in 'getex' command");
+              }
+              opts.ex = sec;
+            } else if (opt === 'PX' && i + 1 < args.length) {
+              optCount++;
+              const ms = Number((args[++i] as any).value?.toString('utf8'));
+              if (!Number.isInteger(ms) || ms <= 0) {
+                return RESPSerializer.encodeError("invalid expire time in 'getex' command");
+              }
+              opts.px = ms;
+            } else if (opt === 'EXAT' && i + 1 < args.length) {
+              optCount++;
+              const sec = Number((args[++i] as any).value?.toString('utf8'));
+              if (!Number.isInteger(sec) || sec <= 0) {
+                return RESPSerializer.encodeError("invalid expire time in 'getex' command");
+              }
+              opts.exat = sec;
+            } else if (opt === 'PXAT' && i + 1 < args.length) {
+              optCount++;
+              const ms = Number((args[++i] as any).value?.toString('utf8'));
+              if (!Number.isInteger(ms) || ms <= 0) {
+                return RESPSerializer.encodeError("invalid expire time in 'getex' command");
+              }
+              opts.pxat = ms;
+            } else {
+              return RESPSerializer.encodeError('syntax error');
+            }
+          }
+
+          if (optCount > 1) {
+            return RESPSerializer.encodeError('syntax error');
+          }
+
+          const val = this.engine.getex(key, opts);
+          this.lastCommandMutated = val !== null && optCount > 0;
+          return RESPSerializer.encodeBulkString(val);
         }
 
         // =======================
@@ -853,12 +1063,46 @@ export class TCPServer {
           const key = (args[1] as any).value.toString('utf8');
           const ms = parseInt((args[2] as any).value.toString('utf8'), 10);
           if (isNaN(ms)) return RESPSerializer.encodeError('value is not an integer or out of range');
-          return RESPSerializer.encodeInteger(this.engine.pexpire(key, ms) ? 1 : 0);
+          const applied = this.engine.pexpire(key, ms);
+          this.lastCommandMutated = applied;
+          return RESPSerializer.encodeInteger(applied ? 1 : 0);
+        }
+
+        case 'EXPIREAT': {
+          if (args.length !== 3) return RESPSerializer.encodeError("wrong number of arguments for 'expireat' command");
+          const key = (args[1] as any).value.toString('utf8');
+          const sec = Number((args[2] as any).value.toString('utf8'));
+          if (!Number.isInteger(sec)) return RESPSerializer.encodeError('value is not an integer or out of range');
+          const applied = this.engine.expireat(key, sec);
+          this.lastCommandMutated = applied;
+          return RESPSerializer.encodeInteger(applied ? 1 : 0);
+        }
+
+        case 'PEXPIREAT': {
+          if (args.length !== 3) return RESPSerializer.encodeError("wrong number of arguments for 'pexpireat' command");
+          const key = (args[1] as any).value.toString('utf8');
+          const ms = Number((args[2] as any).value.toString('utf8'));
+          if (!Number.isInteger(ms)) return RESPSerializer.encodeError('value is not an integer or out of range');
+          const applied = this.engine.pexpireat(key, ms);
+          this.lastCommandMutated = applied;
+          return RESPSerializer.encodeInteger(applied ? 1 : 0);
+        }
+
+        case 'EXPIRETIME': {
+          if (args.length !== 2) return RESPSerializer.encodeError("wrong number of arguments for 'expiretime' command");
+          return RESPSerializer.encodeInteger(this.engine.expiretime((args[1] as any).value.toString('utf8')));
+        }
+
+        case 'PEXPIRETIME': {
+          if (args.length !== 2) return RESPSerializer.encodeError("wrong number of arguments for 'pexpiretime' command");
+          return RESPSerializer.encodeInteger(this.engine.pexpiretime((args[1] as any).value.toString('utf8')));
         }
 
         case 'PERSIST': {
           if (args.length !== 2) return RESPSerializer.encodeError("wrong number of arguments for 'persist' command");
-          return RESPSerializer.encodeInteger(this.engine.persist((args[1] as any).value.toString('utf8')) ? 1 : 0);
+          const applied = this.engine.persist((args[1] as any).value.toString('utf8'));
+          this.lastCommandMutated = applied;
+          return RESPSerializer.encodeInteger(applied ? 1 : 0);
         }
 
         case 'KEYS': {
