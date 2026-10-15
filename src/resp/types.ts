@@ -57,3 +57,11 @@ export const RESP_PREFIX = {
   CR: 0x0d,            // '\r'
   LF: 0x0a,            // '\n'
 } as const;
+
+export interface RESPParserOptions {
+  initialCapacity?: number;
+  maxBulkLength?: number;
+  maxArrayLength?: number;
+  maxInlineLength?: number;
+  maxDepth?: number;
+}

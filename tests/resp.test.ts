@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { RESPParser } from '../src/resp/parser.ts';
+import { RESPParser, ProtocolError } from '../src/resp/parser.ts';
 import { RESPSerializer, RESP_CONSTANTS } from '../src/resp/serializer.ts';
 import type { RESPValue } from '../src/resp/types.ts';
 
@@ -138,4 +138,76 @@ test('RESP Serializer: Standard Encoding', () => {
     RESPSerializer.encodeArray(['foo', 123, null]).toString(),
     '*3\r\n$3\r\nfoo\r\n:123\r\n$-1\r\n'
   );
+});
+
+test('RESP Parser: Strict Length & Integer Validation rejects malformed headers', () => {
+  const parser = new RESPParser();
+
+  assert.throws(() => {
+    parser.feed(Buffer.from('$5abc\r\nhello\r\n'));
+    parser.parse();
+  }, ProtocolError);
+
+  assert.throws(() => {
+    parser.feed(Buffer.from('*2xyz\r\n$1\r\na\r\n$1\r\nb\r\n'));
+    parser.parse();
+  }, ProtocolError);
+
+  assert.throws(() => {
+    parser.feed(Buffer.from(':\r\n'));
+    parser.parse();
+  }, ProtocolError);
+
+  assert.throws(() => {
+    parser.feed(Buffer.from(':12.5\r\n'));
+    parser.parse();
+  }, ProtocolError);
+});
+
+test('RESP Parser: Enforces maxBulkLength, maxArrayLength, maxDepth, and maxInlineLength', () => {
+  // 1. maxBulkLength rejects oversized header before buffering full payload
+  const bulkParser = new RESPParser({ maxBulkLength: 32 });
+  assert.throws(() => {
+    bulkParser.feed(Buffer.from('$1024\r\n'));
+    bulkParser.parse();
+  }, /exceeds maximum allowed 32/);
+
+  // 2. maxArrayLength rejects excessive element count
+  const arrParser = new RESPParser({ maxArrayLength: 8 });
+  assert.throws(() => {
+    arrParser.feed(Buffer.from('*100\r\n'));
+    arrParser.parse();
+  }, /exceeds maximum allowed 8/);
+
+  // 3. maxDepth rejects deeply nested arrays
+  const depthParser = new RESPParser({ maxDepth: 3 });
+  assert.throws(() => {
+    depthParser.feed(Buffer.from('*1\r\n*1\r\n*1\r\n*1\r\n+OK\r\n'));
+    depthParser.parse();
+  }, /nesting depth exceeds maximum allowed 3/);
+
+  // 4. maxInlineLength rejects unbounded unterminated lines
+  const lineParser = new RESPParser({ maxInlineLength: 16 });
+  assert.throws(() => {
+    lineParser.feed(Buffer.from('PING_WITHOUT_CRLF_EXCEEDING_LIMIT'));
+    lineParser.parse();
+  }, /exceeds maximum allowed 16/);
+});
+
+test('RESP Parser: Inline Command Escapes, Single Quotes, and Unbalanced Quote Rejection', () => {
+  const parser = new RESPParser();
+  parser.feed(Buffer.from('SET msg "hello \\"world\\"\\nnext" \'literal quote\'\r\n'));
+  const frames = parser.parse();
+  assert.equal(frames.length, 1);
+  const arr = (frames[0] as any).value;
+  assert.equal(arr.length, 4);
+  assert.equal(arr[0].value.toString(), 'SET');
+  assert.equal(arr[1].value.toString(), 'msg');
+  assert.equal(arr[2].value.toString(), 'hello "world"\nnext');
+  assert.equal(arr[3].value.toString(), 'literal quote');
+
+  assert.throws(() => {
+    parser.feed(Buffer.from('SET key "unclosed quote\r\n'));
+    parser.parse();
+  }, /Unbalanced quotes/);
 });

@@ -1,4 +1,4 @@
-import { type RESPValue, RESP_PREFIX } from './types.ts';
+import { type RESPValue, type RESPParserOptions, RESP_PREFIX } from './types.ts';
 
 export class ProtocolError extends Error {
   constructor(message: string) {
@@ -6,6 +6,15 @@ export class ProtocolError extends Error {
     this.name = 'ProtocolError';
   }
 }
+
+const DEFAULT_INITIAL_CAPACITY = 64 * 1024;
+const DEFAULT_MAX_BULK_LENGTH = 64 * 1024 * 1024; // 64 MB
+const DEFAULT_MAX_ARRAY_LENGTH = 65536;
+const DEFAULT_MAX_INLINE_LENGTH = 64 * 1024; // 64 KB
+const DEFAULT_MAX_DEPTH = 16;
+
+const STRICT_LENGTH_REGEX = /^-?\d+$/;
+const STRICT_INTEGER_REGEX = /^[+-]?\d+$/;
 
 /**
  * Streaming zero-copy RESP Parser.
@@ -16,14 +25,32 @@ export class ProtocolError extends Error {
  * - Binary-safe bulk strings (containing \r\n or \0 inside data)
  * - Inline commands (telnet/netcat style without RESP prefixes)
  * - Amortized O(1) buffer compaction to eliminate memory fragmentation
+ * - Protocol framing bounds (max bulk size, array count, nesting depth, and line length)
  */
 export class RESPParser {
   private buffer: Buffer;
   private readOffset: number = 0;
   private writeOffset: number = 0;
+  private readonly maxBulkLength: number;
+  private readonly maxArrayLength: number;
+  private readonly maxInlineLength: number;
+  private readonly maxDepth: number;
 
-  constructor(initialCapacity: number = 64 * 1024) {
-    this.buffer = Buffer.allocUnsafe(initialCapacity);
+  constructor(optionsOrCapacity: number | RESPParserOptions = DEFAULT_INITIAL_CAPACITY) {
+    if (typeof optionsOrCapacity === 'number') {
+      this.buffer = Buffer.allocUnsafe(optionsOrCapacity);
+      this.maxBulkLength = DEFAULT_MAX_BULK_LENGTH;
+      this.maxArrayLength = DEFAULT_MAX_ARRAY_LENGTH;
+      this.maxInlineLength = DEFAULT_MAX_INLINE_LENGTH;
+      this.maxDepth = DEFAULT_MAX_DEPTH;
+    } else {
+      const cap = optionsOrCapacity.initialCapacity ?? DEFAULT_INITIAL_CAPACITY;
+      this.buffer = Buffer.allocUnsafe(cap);
+      this.maxBulkLength = optionsOrCapacity.maxBulkLength ?? DEFAULT_MAX_BULK_LENGTH;
+      this.maxArrayLength = optionsOrCapacity.maxArrayLength ?? DEFAULT_MAX_ARRAY_LENGTH;
+      this.maxInlineLength = optionsOrCapacity.maxInlineLength ?? DEFAULT_MAX_INLINE_LENGTH;
+      this.maxDepth = optionsOrCapacity.maxDepth ?? DEFAULT_MAX_DEPTH;
+    }
   }
 
   /**
@@ -76,7 +103,7 @@ export class RESPParser {
     while (this.readOffset < this.writeOffset) {
       const savedOffset = this.readOffset;
       try {
-        const val = this.parseFrame();
+        const val = this.parseFrame(0);
         if (val === null) {
           // Frame is incomplete; backtrack cursor and await more bytes
           this.readOffset = savedOffset;
@@ -119,7 +146,7 @@ export class RESPParser {
     while (this.readOffset < this.writeOffset) {
       const savedOffset = this.readOffset;
       try {
-        const val = this.parseFrame();
+        const val = this.parseFrame(0);
         if (val === null) {
           this.readOffset = savedOffset;
           break;
@@ -152,7 +179,7 @@ export class RESPParser {
    * Internal recursive frame parser.
    * Returns RESPValue if frame is complete, or null if more bytes are needed.
    */
-  private parseFrame(): RESPValue | null {
+  private parseFrame(depth: number): RESPValue | null {
     if (this.readOffset >= this.writeOffset) {
       return null;
     }
@@ -173,7 +200,7 @@ export class RESPParser {
         return this.parseBulkString();
 
       case RESP_PREFIX.ARRAY:
-        return this.parseArray();
+        return this.parseArray(depth);
 
       default:
         // Inline command fallback (e.g. "PING\r\n" or "SET foo bar\r\n")
@@ -182,16 +209,40 @@ export class RESPParser {
   }
 
   /**
-   * Finds the next CRLF (\r\n) starting from this.readOffset.
-   * Returns index of '\r', or -1 if not found.
+   * Finds the next CRLF (\r\n) starting from start.
+   * Enforces maxInlineLength on unterminated header/inline lines to prevent unbounded scans.
+   * Returns index of '\r', or -1 if not found yet.
    */
   private findCRLF(start: number = this.readOffset): number {
     for (let i = start; i < this.writeOffset - 1; i++) {
       if (this.buffer[i] === RESP_PREFIX.CR && this.buffer[i + 1] === RESP_PREFIX.LF) {
+        if (i - start > this.maxInlineLength) {
+          throw new ProtocolError(
+            `Protocol line length ${i - start} exceeds maximum allowed ${this.maxInlineLength}`
+          );
+        }
         return i;
       }
     }
+
+    if (this.writeOffset - start > this.maxInlineLength) {
+      throw new ProtocolError(
+        `Unterminated protocol line exceeds maximum allowed ${this.maxInlineLength} bytes`
+      );
+    }
+
     return -1;
+  }
+
+  private parseStrictLength(raw: string, label: string): number {
+    if (!STRICT_LENGTH_REGEX.test(raw)) {
+      throw new ProtocolError(`Invalid ${label} length: "${raw}"`);
+    }
+    const num = Number(raw);
+    if (!Number.isSafeInteger(num)) {
+      throw new ProtocolError(`Out-of-range ${label} length: "${raw}"`);
+    }
+    return num;
   }
 
   /**
@@ -226,6 +277,10 @@ export class RESPParser {
     if (crlf === -1) return null;
 
     const raw = this.buffer.toString('ascii', this.readOffset + 1, crlf);
+    if (!STRICT_INTEGER_REGEX.test(raw)) {
+      throw new ProtocolError(`Invalid integer representation: ${raw}`);
+    }
+
     const num = Number(raw);
     if (!Number.isSafeInteger(num)) {
       try {
@@ -249,11 +304,7 @@ export class RESPParser {
     if (crlf === -1) return null;
 
     const lenStr = this.buffer.toString('ascii', this.readOffset + 1, crlf);
-    const length = parseInt(lenStr, 10);
-
-    if (isNaN(length)) {
-      throw new ProtocolError(`Invalid bulk string length: "${lenStr}"`);
-    }
+    const length = this.parseStrictLength(lenStr, 'bulk string');
 
     // Null Bulk String ($-1\r\n)
     if (length === -1) {
@@ -263,6 +314,12 @@ export class RESPParser {
 
     if (length < -1) {
       throw new ProtocolError(`Negative bulk string length invalid: ${length}`);
+    }
+
+    if (length > this.maxBulkLength) {
+      throw new ProtocolError(
+        `Bulk string length ${length} exceeds maximum allowed ${this.maxBulkLength}`
+      );
     }
 
     const dataStart = crlf + 2;
@@ -292,16 +349,18 @@ export class RESPParser {
   /**
    * Parses Array: *<count>\r\n<element_1>...<element_n> or *-1\r\n (null)
    */
-  private parseArray(): RESPValue | null {
+  private parseArray(depth: number): RESPValue | null {
+    if (depth >= this.maxDepth) {
+      throw new ProtocolError(
+        `Array nesting depth exceeds maximum allowed ${this.maxDepth}`
+      );
+    }
+
     const crlf = this.findCRLF(this.readOffset + 1);
     if (crlf === -1) return null;
 
     const countStr = this.buffer.toString('ascii', this.readOffset + 1, crlf);
-    const count = parseInt(countStr, 10);
-
-    if (isNaN(count)) {
-      throw new ProtocolError(`Invalid array length: "${countStr}"`);
-    }
+    const count = this.parseStrictLength(countStr, 'array');
 
     // Null Array (*-1\r\n)
     if (count === -1) {
@@ -311,6 +370,12 @@ export class RESPParser {
 
     if (count < -1) {
       throw new ProtocolError(`Negative array length invalid: ${count}`);
+    }
+
+    if (count > this.maxArrayLength) {
+      throw new ProtocolError(
+        `Array length ${count} exceeds maximum allowed ${this.maxArrayLength}`
+      );
     }
 
     if (count === 0) {
@@ -323,7 +388,7 @@ export class RESPParser {
 
     const elements: RESPValue[] = [];
     for (let i = 0; i < count; i++) {
-      const element = this.parseFrame();
+      const element = this.parseFrame(depth + 1);
       if (element === null) {
         // Rollback whole array if any child element is incomplete
         this.readOffset = currentOffset;
@@ -336,8 +401,8 @@ export class RESPParser {
   }
 
   /**
-   * Handles inline telnet commands: e.g. "PING\r\n" or "SET key val\r\n"
-   * Emits an array of bulk strings identical to RESP array command format.
+   * Handles inline telnet commands: e.g. "PING\r\n" or "SET key \"hello world\"\r\n"
+   * Supports double-quoted and single-quoted arguments with escape sequences.
    */
   private parseInlineCommand(): RESPValue | null {
     const crlf = this.findCRLF(this.readOffset);
@@ -350,19 +415,90 @@ export class RESPParser {
       return null;
     }
 
-    // Split on whitespace respecting quotes
-    const parts = line.match(/(?:[^\s"]+|"[^"]*")+/g) || [];
-    const elements: RESPValue[] = parts.map((part) => {
-      let unquoted = part;
-      if (unquoted.startsWith('"') && unquoted.endsWith('"')) {
-        unquoted = unquoted.slice(1, -1);
-      }
-      return {
-        type: 'bulk_string',
-        value: Buffer.from(unquoted, 'utf8'),
-      };
-    });
+    const tokens = RESPParser.splitInlineArgs(line);
+    const elements: RESPValue[] = tokens.map((token) => ({
+      type: 'bulk_string',
+      value: Buffer.from(token, 'utf8'),
+    }));
 
     return { type: 'array', value: elements };
+  }
+
+  /**
+   * Splits an inline telnet command line into tokens respecting single/double quotes and escapes.
+   */
+  public static splitInlineArgs(line: string): string[] {
+    const args: string[] = [];
+    let i = 0;
+    const len = line.length;
+
+    while (i < len) {
+      while (i < len && (line[i] === ' ' || line[i] === '\t')) {
+        i++;
+      }
+      if (i >= len) break;
+
+      let current = '';
+      let inDoubleQuotes = false;
+      let inSingleQuotes = false;
+      let done = false;
+
+      while (!done) {
+        if (inDoubleQuotes) {
+          if (i >= len) {
+            throw new ProtocolError('Unbalanced quotes in inline request');
+          }
+          if (line[i] === '\\' && i + 1 < len) {
+            i++;
+            const esc = line[i];
+            if (esc === 'n') current += '\n';
+            else if (esc === 'r') current += '\r';
+            else if (esc === 't') current += '\t';
+            else current += esc;
+          } else if (line[i] === '"') {
+            if (i + 1 < len && line[i + 1] !== ' ' && line[i + 1] !== '\t') {
+              throw new ProtocolError('Closing quote must be followed by whitespace in inline request');
+            }
+            done = true;
+          } else {
+            current += line[i];
+          }
+          i++;
+        } else if (inSingleQuotes) {
+          if (i >= len) {
+            throw new ProtocolError('Unbalanced quotes in inline request');
+          }
+          if (line[i] === '\\' && i + 1 < len && line[i + 1] === "'") {
+            i++;
+            current += "'";
+          } else if (line[i] === "'") {
+            if (i + 1 < len && line[i + 1] !== ' ' && line[i + 1] !== '\t') {
+              throw new ProtocolError('Closing quote must be followed by whitespace in inline request');
+            }
+            done = true;
+          } else {
+            current += line[i];
+          }
+          i++;
+        } else {
+          if (i >= len || line[i] === ' ' || line[i] === '\t') {
+            done = true;
+          } else if (line[i] === '"' && current.length === 0) {
+            inDoubleQuotes = true;
+            i++;
+          } else if (line[i] === "'" && current.length === 0) {
+            inSingleQuotes = true;
+            i++;
+          } else {
+            current += line[i];
+            i++;
+          }
+        }
+      }
+
+      args.push(current);
+    }
+
+    return args;
   }
 }
