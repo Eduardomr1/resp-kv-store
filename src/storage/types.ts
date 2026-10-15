@@ -70,6 +70,14 @@ export interface SetOptions {
   keepttl?: boolean; // Retain current TTL
 }
 
+export interface GetExOptions {
+  ex?: number;       // Expire time in seconds
+  px?: number;       // Expire time in milliseconds
+  exat?: number;     // Expire absolute Unix timestamp in seconds
+  pxat?: number;     // Expire absolute Unix timestamp in milliseconds
+  persist?: boolean; // Remove existing TTL
+}
+
 export type FsyncPolicy = 'always' | 'everysec' | 'no';
 
 export interface EngineOptions {

@@ -8,12 +8,28 @@ import {
   type StorageData,
   type RedisDataType,
   type SetOptions,
+  type GetExOptions,
   type EngineOptions,
   type StorageStats,
   WrongTypeError,
 } from './types.ts';
 import { MemoryGovernor } from '../eviction/governor.ts';
 import { updateLFU, LFU_INIT_VAL } from '../eviction/lfu.ts';
+
+const MIN_INT64 = -9223372036854775808n;
+const MAX_INT64 = 9223372036854775807n;
+const STRICT_INT64_REGEX = /^[+-]?\d+$/;
+
+export function parseSignedInt64(raw: string): bigint {
+  if (!STRICT_INT64_REGEX.test(raw)) {
+    throw new Error('ERR value is not an integer or out of range');
+  }
+  const val = BigInt(raw);
+  if (val < MIN_INT64 || val > MAX_INT64) {
+    throw new Error('ERR value is not an integer or out of range');
+  }
+  return val;
+}
 
 /**
  * High-Performance Concurrent-friendly In-Memory Storage Engine.
@@ -364,6 +380,174 @@ export class StorageEngine {
         throw err;
       }
     });
+  }
+
+  public mset(entries: Array<[string, Buffer | string]>): void {
+    for (const [key, value] of entries) {
+      this.set(key, value);
+    }
+  }
+
+  public msetnx(entries: Array<[string, Buffer | string]>): boolean {
+    for (const [key] of entries) {
+      const existing = this.store.get(key);
+      if (existing !== undefined && !this.isExpired(key, existing)) {
+        return false;
+      }
+    }
+    for (const [key, value] of entries) {
+      this.set(key, value);
+    }
+    return true;
+  }
+
+  public incr(key: string): number | bigint {
+    return this.incrby(key, 1n);
+  }
+
+  public decr(key: string): number | bigint {
+    return this.incrby(key, -1n);
+  }
+
+  public incrby(key: string, increment: number | bigint | string): number | bigint {
+    const delta =
+      typeof increment === 'bigint'
+        ? increment
+        : parseSignedInt64(increment.toString());
+    if (delta < MIN_INT64 || delta > MAX_INT64) {
+      throw new Error('ERR value is not an integer or out of range');
+    }
+
+    let entry = this.store.get(key);
+    if (entry && this.isExpired(key, entry)) {
+      entry = undefined;
+    }
+
+    let current = 0n;
+    if (entry) {
+      if (entry.data.type !== 'string') {
+        throw new WrongTypeError();
+      }
+      current = parseSignedInt64(entry.data.value.toString('utf8'));
+    }
+
+    const next = current + delta;
+    if (next < MIN_INT64 || next > MAX_INT64) {
+      throw new Error('ERR increment or decrement would overflow');
+    }
+
+    this.set(key, Buffer.from(next.toString(), 'ascii'), { keepttl: true });
+    const asNum = Number(next);
+    return Number.isSafeInteger(asNum) ? asNum : next;
+  }
+
+  public decrby(key: string, decrement: number | bigint | string): number | bigint {
+    const delta =
+      typeof decrement === 'bigint'
+        ? decrement
+        : parseSignedInt64(decrement.toString());
+    if (delta < MIN_INT64 || delta > MAX_INT64) {
+      throw new Error('ERR value is not an integer or out of range');
+    }
+    if (delta === MIN_INT64) {
+      // -MIN_INT64 overflows signed 64-bit integer
+      throw new Error('ERR decrement would overflow');
+    }
+    return this.incrby(key, -delta);
+  }
+
+  public append(key: string, value: Buffer | string): number {
+    const appendBuf = Buffer.isBuffer(value) ? value : Buffer.from(value, 'utf8');
+    let entry = this.store.get(key);
+    if (entry && this.isExpired(key, entry)) {
+      entry = undefined;
+    }
+
+    if (!entry) {
+      this.set(key, appendBuf);
+      return appendBuf.length;
+    }
+
+    if (entry.data.type !== 'string') {
+      throw new WrongTypeError();
+    }
+
+    const combined = Buffer.concat([entry.data.value, appendBuf]);
+    this.set(key, combined, { keepttl: true });
+    return combined.length;
+  }
+
+  public strlen(key: string): number {
+    const entry = this.store.get(key);
+    if (!entry || this.isExpired(key, entry)) {
+      return 0;
+    }
+    if (entry.data.type !== 'string') {
+      throw new WrongTypeError();
+    }
+    this.recordAccess(entry);
+    return entry.data.value.length;
+  }
+
+  public getdel(key: string): Buffer | null {
+    const entry = this.store.get(key);
+    if (!entry || this.isExpired(key, entry)) {
+      this.statsCounters.misses++;
+      return null;
+    }
+    if (entry.data.type !== 'string') {
+      throw new WrongTypeError();
+    }
+    this.statsCounters.hits++;
+    const val = entry.data.value;
+    this.deleteInternal(key, true);
+    this.logAOF(['DEL', key]);
+    return val;
+  }
+
+  public getex(key: string, options: GetExOptions = {}): Buffer | null {
+    const entry = this.store.get(key);
+    if (!entry || this.isExpired(key, entry)) {
+      this.statsCounters.misses++;
+      return null;
+    }
+    if (entry.data.type !== 'string') {
+      throw new WrongTypeError();
+    }
+
+    this.statsCounters.hits++;
+    this.recordAccess(entry);
+    const val = entry.data.value;
+    const now = Date.now();
+
+    if (options.persist) {
+      this.persist(key);
+      return val;
+    }
+
+    let expiresAt: number | null = null;
+    if (options.ex !== undefined) {
+      expiresAt = now + Math.round(options.ex * 1000);
+    } else if (options.px !== undefined) {
+      expiresAt = now + Math.round(options.px);
+    } else if (options.exat !== undefined) {
+      expiresAt = Math.round(options.exat * 1000);
+    } else if (options.pxat !== undefined) {
+      expiresAt = Math.round(options.pxat);
+    }
+
+    if (expiresAt !== null) {
+      if (expiresAt <= now) {
+        this.deleteInternal(key, true);
+        this.logAOF(['DEL', key]);
+      } else {
+        entry.expiresAt = expiresAt;
+        this.addToExpiringList(key, expiresAt);
+        this.logAOF(['PEXPIREAT', key, expiresAt.toString()]);
+      }
+    }
+
+    return val;
   }
 
   // ==========================================
@@ -1273,6 +1457,18 @@ export class StorageEngine {
     if (!entry || this.isExpired(key, entry)) return false;
 
     const expiresAt = Date.now() + Math.round(ms);
+    return this.pexpireat(key, expiresAt);
+  }
+
+  public expireat(key: string, unixSeconds: number): boolean {
+    return this.pexpireat(key, Math.round(unixSeconds * 1000));
+  }
+
+  public pexpireat(key: string, unixMs: number): boolean {
+    const entry = this.store.get(key);
+    if (!entry || this.isExpired(key, entry)) return false;
+
+    const expiresAt = Math.round(unixMs);
     if (expiresAt <= Date.now()) {
       this.deleteInternal(key, true);
       this.logAOF(['DEL', key]);
@@ -1283,6 +1479,20 @@ export class StorageEngine {
     this.addToExpiringList(key, expiresAt);
     this.logAOF(['PEXPIREAT', key, expiresAt.toString()]);
     return true;
+  }
+
+  public expiretime(key: string): number {
+    const entry = this.store.get(key);
+    if (!entry || this.isExpired(key, entry)) return -2;
+    if (entry.expiresAt === null) return -1;
+    return Math.floor(entry.expiresAt / 1000);
+  }
+
+  public pexpiretime(key: string): number {
+    const entry = this.store.get(key);
+    if (!entry || this.isExpired(key, entry)) return -2;
+    if (entry.expiresAt === null) return -1;
+    return entry.expiresAt;
   }
 
   public persist(key: string): boolean {
@@ -1391,9 +1601,43 @@ export class StorageEngine {
       const pxat = Number(args[2].toString('utf8'));
       const entry = this.store.get(key);
       if (entry) {
-        entry.expiresAt = pxat;
-        this.addToExpiringList(key, pxat);
+        if (pxat <= Date.now()) {
+          this.deleteInternal(key, true);
+        } else {
+          entry.expiresAt = pxat;
+          this.addToExpiringList(key, pxat);
+        }
       }
+    } else if (cmd === 'PERSIST' && args.length >= 2) {
+      this.persist(args[1].toString('utf8'));
+    } else if (cmd === 'HDEL' && args.length >= 3) {
+      const key = args[1].toString('utf8');
+      const fields = args.slice(2).map((b) => b.toString('utf8'));
+      this.hdel(key, ...fields);
+    } else if (cmd === 'LPOP' && args.length >= 2) {
+      const key = args[1].toString('utf8');
+      const count = args.length >= 3 ? parseInt(args[2].toString('utf8'), 10) : 1;
+      this.lpop(key, count);
+    } else if (cmd === 'RPOP' && args.length >= 2) {
+      const key = args[1].toString('utf8');
+      const count = args.length >= 3 ? parseInt(args[2].toString('utf8'), 10) : 1;
+      this.rpop(key, count);
+    } else if (cmd === 'SREM' && args.length >= 3) {
+      const key = args[1].toString('utf8');
+      const members = args.slice(2).map((b) => b.toString('utf8'));
+      this.srem(key, ...members);
+    } else if (cmd === 'ZREM' && args.length >= 3) {
+      const key = args[1].toString('utf8');
+      const members = args.slice(2).map((b) => b.toString('utf8'));
+      this.zrem(key, ...members);
+    } else if (cmd === 'XADD' && args.length >= 5) {
+      const key = args[1].toString('utf8');
+      const id = args[2].toString('utf8');
+      const fields: [string, Buffer][] = [];
+      for (let i = 3; i + 1 < args.length; i += 2) {
+        fields.push([args[i].toString('utf8'), args[i + 1]]);
+      }
+      this.xadd(key, id, fields);
     } else if (cmd === 'FLUSHALL') {
       this.flushall();
     }
