@@ -41,6 +41,7 @@ export class TCPServer {
   private rdbFilePath: string;
   private isRunning: boolean = false;
   private lastCommandMutated: boolean = false;
+  private lastMutatedKeys: string[] | null = null;
 
   constructor(options: ServerOptions = {}) {
     this.port = options.port ?? 6379;
@@ -196,12 +197,28 @@ export class TCPServer {
 
   private static readonly WRITE_COMMANDS = new Set([
     'SET', 'MSET', 'MSETNX', 'INCR', 'INCRBY', 'DECR', 'DECRBY', 'APPEND', 'GETDEL', 'GETEX',
-    'DEL', 'HSET', 'HDEL', 'LPUSH', 'RPUSH', 'LPOP', 'RPOP',
-    'SADD', 'SREM', 'ZADD', 'ZREM', 'EXPIRE', 'PEXPIRE', 'EXPIREAT', 'PEXPIREAT', 'PERSIST',
+    'DEL', 'HSET', 'HSETNX', 'HINCRBY', 'HDEL',
+    'LPUSH', 'RPUSH', 'LPOP', 'RPOP', 'LSET', 'LTRIM', 'LMOVE',
+    'SADD', 'SREM', 'SPOP', 'SMOVE', 'SUNIONSTORE', 'SINTERSTORE', 'SDIFFSTORE',
+    'ZADD', 'ZINCRBY', 'ZREM', 'ZPOPMIN', 'ZPOPMAX', 'ZMPOP',
+    'EXPIRE', 'PEXPIRE', 'EXPIREAT', 'PEXPIREAT', 'PERSIST',
     'FLUSHALL', 'FLUSHDB', 'XADD', 'SETBIT', 'BITOP', 'PFADD', 'PFMERGE'
   ]);
 
+  private static parseStrictInt(raw: string): number | null {
+    if (!/^[+-]?\d+$/.test(raw)) return null;
+    const num = Number(raw);
+    if (!Number.isSafeInteger(num)) return null;
+    return num;
+  }
+
   private touchKeysForCommand(commandName: string, args: RESPValue[]): void {
+    if (this.lastMutatedKeys !== null) {
+      for (const k of this.lastMutatedKeys) {
+        this.transactions.touchKey(k);
+      }
+      return;
+    }
     if (args.length < 2) return;
     if (commandName === 'FLUSHALL' || commandName === 'FLUSHDB') {
       for (const key of this.transactions.keyVersions.keys()) {
@@ -286,6 +303,7 @@ export class TCPServer {
         args.map((a: any) => a.value),
         () => {
           this.lastCommandMutated = TCPServer.WRITE_COMMANDS.has(commandName);
+          this.lastMutatedKeys = null;
           const res = this.dispatchCommand(commandName, args, socket, session) ?? RESP_CONSTANTS.OK;
           if (res && this.lastCommandMutated && res[0] !== 0x2d) {
             this.replication.propagate(RESPSerializer.encodeArray(args));
@@ -298,6 +316,7 @@ export class TCPServer {
     }
 
     this.lastCommandMutated = TCPServer.WRITE_COMMANDS.has(commandName);
+    this.lastMutatedKeys = null;
     const result = this.dispatchCommand(commandName, args, socket, session);
     if (result && this.lastCommandMutated) {
       if (result.length > 0 && result[0] !== 0x2d) {
@@ -758,6 +777,69 @@ export class TCPServer {
           return RESPSerializer.encodeInteger(this.engine.hlen(key));
         }
 
+        case 'HSETNX': {
+          if (args.length !== 4) {
+            return RESPSerializer.encodeError("wrong number of arguments for 'hsetnx' command");
+          }
+          const key = (args[1] as any).value.toString('utf8');
+          const field = (args[2] as any).value.toString('utf8');
+          const val = (args[3] as any).value;
+          const created = this.engine.hsetnx(key, field, val);
+          this.lastCommandMutated = created;
+          return RESPSerializer.encodeInteger(created ? 1 : 0);
+        }
+
+        case 'HINCRBY': {
+          if (args.length !== 4) {
+            return RESPSerializer.encodeError("wrong number of arguments for 'hincrby' command");
+          }
+          try {
+            const key = (args[1] as any).value.toString('utf8');
+            const field = (args[2] as any).value.toString('utf8');
+            const inc = (args[3] as any).value.toString('utf8');
+            const next = this.engine.hincrby(key, field, inc);
+            return RESPSerializer.encodeInteger(next);
+          } catch (err: any) {
+            if (err instanceof WrongTypeError || err instanceof OOMError) throw err;
+            this.lastCommandMutated = false;
+            return RESPSerializer.encodeError(err.message);
+          }
+        }
+
+        case 'HSTRLEN': {
+          if (args.length !== 3) {
+            return RESPSerializer.encodeError("wrong number of arguments for 'hstrlen' command");
+          }
+          const key = (args[1] as any).value.toString('utf8');
+          const field = (args[2] as any).value.toString('utf8');
+          return RESPSerializer.encodeInteger(this.engine.hstrlen(key, field));
+        }
+
+        case 'HRANDFIELD': {
+          if (args.length < 2 || args.length > 4) {
+            return RESPSerializer.encodeError("wrong number of arguments for 'hrandfield' command");
+          }
+          const key = (args[1] as any).value.toString('utf8');
+          if (args.length === 2) {
+            const picked = this.engine.hrandfield(key) as string | null;
+            return RESPSerializer.encodeBulkString(picked);
+          }
+          const count = TCPServer.parseStrictInt((args[2] as any).value.toString('utf8'));
+          if (count === null) {
+            return RESPSerializer.encodeError('value is not an integer or out of range');
+          }
+          let withValues = false;
+          if (args.length === 4) {
+            const flag = (args[3] as any).value.toString('utf8').toUpperCase();
+            if (flag !== 'WITHVALUES') {
+              return RESPSerializer.encodeError('syntax error');
+            }
+            withValues = true;
+          }
+          const pickedList = this.engine.hrandfield(key, count, withValues) as (string | Buffer)[];
+          return RESPSerializer.encodeArray(pickedList);
+        }
+
         // =======================
         // LIST OPERATIONS
         // =======================
@@ -913,6 +995,90 @@ export class TCPServer {
           return RESPSerializer.encodeInteger(this.engine.llen(key));
         }
 
+        case 'LINDEX': {
+          if (args.length !== 3) {
+            return RESPSerializer.encodeError("wrong number of arguments for 'lindex' command");
+          }
+          const key = (args[1] as any).value.toString('utf8');
+          const index = TCPServer.parseStrictInt((args[2] as any).value.toString('utf8'));
+          if (index === null) {
+            return RESPSerializer.encodeError('value is not an integer or out of range');
+          }
+          return RESPSerializer.encodeBulkString(this.engine.lindex(key, index));
+        }
+
+        case 'LSET': {
+          if (args.length !== 4) {
+            return RESPSerializer.encodeError("wrong number of arguments for 'lset' command");
+          }
+          const key = (args[1] as any).value.toString('utf8');
+          const index = TCPServer.parseStrictInt((args[2] as any).value.toString('utf8'));
+          if (index === null) {
+            this.lastCommandMutated = false;
+            return RESPSerializer.encodeError('value is not an integer or out of range');
+          }
+          const val = (args[3] as any).value;
+          try {
+            this.engine.lset(key, index, val);
+            return RESP_CONSTANTS.OK;
+          } catch (err: any) {
+            if (err instanceof WrongTypeError || err instanceof OOMError) throw err;
+            this.lastCommandMutated = false;
+            return RESPSerializer.encodeError(err.message);
+          }
+        }
+
+        case 'LTRIM': {
+          if (args.length !== 4) {
+            return RESPSerializer.encodeError("wrong number of arguments for 'ltrim' command");
+          }
+          const key = (args[1] as any).value.toString('utf8');
+          const start = TCPServer.parseStrictInt((args[2] as any).value.toString('utf8'));
+          const stop = TCPServer.parseStrictInt((args[3] as any).value.toString('utf8'));
+          if (start === null || stop === null) {
+            this.lastCommandMutated = false;
+            return RESPSerializer.encodeError('value is not an integer or out of range');
+          }
+          this.engine.ltrim(key, start, stop);
+          return RESP_CONSTANTS.OK;
+        }
+
+        case 'LMOVE': {
+          if (args.length !== 5) {
+            return RESPSerializer.encodeError("wrong number of arguments for 'lmove' command");
+          }
+          const source = (args[1] as any).value.toString('utf8');
+          const destination = (args[2] as any).value.toString('utf8');
+          const whereFrom = (args[3] as any).value.toString('utf8').toUpperCase();
+          const whereTo = (args[4] as any).value.toString('utf8').toUpperCase();
+          if ((whereFrom !== 'LEFT' && whereFrom !== 'RIGHT') || (whereTo !== 'LEFT' && whereTo !== 'RIGHT')) {
+            this.lastCommandMutated = false;
+            return RESPSerializer.encodeError('syntax error');
+          }
+          const moved = this.engine.lmove(source, destination, whereFrom, whereTo);
+          if (moved === null) {
+            this.lastCommandMutated = false;
+            return RESP_CONSTANTS.NULL_BULK;
+          }
+          if (this.blocking.hasBlockedClients(destination)) {
+            const poppedForBlocked =
+              whereTo === 'LEFT'
+                ? (this.engine.lpop(destination, 1) as Buffer | null)
+                : (this.engine.rpop(destination, 1) as Buffer | null);
+            if (poppedForBlocked !== null) {
+              if (!this.blocking.signalPush(destination, poppedForBlocked, whereTo === 'LEFT' ? 'left' : 'right')) {
+                if (whereTo === 'LEFT') {
+                  this.engine.lpush(destination, poppedForBlocked);
+                } else {
+                  this.engine.rpush(destination, poppedForBlocked);
+                }
+              }
+            }
+          }
+          this.lastMutatedKeys = source === destination ? [source] : [source, destination];
+          return RESPSerializer.encodeBulkString(moved);
+        }
+
         // =======================
         // SET OPERATIONS
         // =======================
@@ -957,6 +1123,116 @@ export class TCPServer {
           }
           const key = (args[1] as any).value.toString('utf8');
           return RESPSerializer.encodeInteger(this.engine.scard(key));
+        }
+
+        case 'SMISMEMBER': {
+          if (args.length < 3) {
+            return RESPSerializer.encodeError("wrong number of arguments for 'smismember' command");
+          }
+          const key = (args[1] as any).value.toString('utf8');
+          const members = args.slice(2).map((a: any) => a.value.toString('utf8'));
+          return RESPSerializer.encodeArray(this.engine.smismember(key, members));
+        }
+
+        case 'SRANDMEMBER': {
+          if (args.length < 2 || args.length > 3) {
+            return RESPSerializer.encodeError("wrong number of arguments for 'srandmember' command");
+          }
+          const key = (args[1] as any).value.toString('utf8');
+          if (args.length === 2) {
+            return RESPSerializer.encodeBulkString(this.engine.srandmember(key) as string | null);
+          }
+          const count = TCPServer.parseStrictInt((args[2] as any).value.toString('utf8'));
+          if (count === null) {
+            return RESPSerializer.encodeError('value is not an integer or out of range');
+          }
+          return RESPSerializer.encodeArray(this.engine.srandmember(key, count) as string[]);
+        }
+
+        case 'SPOP': {
+          if (args.length < 2 || args.length > 3) {
+            return RESPSerializer.encodeError("wrong number of arguments for 'spop' command");
+          }
+          const key = (args[1] as any).value.toString('utf8');
+          if (args.length === 2) {
+            const popped = this.engine.spop(key) as string | null;
+            this.lastCommandMutated = popped !== null;
+            return RESPSerializer.encodeBulkString(popped);
+          }
+          const count = TCPServer.parseStrictInt((args[2] as any).value.toString('utf8'));
+          if (count === null || count < 0) {
+            this.lastCommandMutated = false;
+            return RESPSerializer.encodeError('value is out of range, must be positive');
+          }
+          const poppedList = this.engine.spop(key, count) as string[];
+          this.lastCommandMutated = poppedList.length > 0;
+          return RESPSerializer.encodeArray(poppedList);
+        }
+
+        case 'SMOVE': {
+          if (args.length !== 4) {
+            return RESPSerializer.encodeError("wrong number of arguments for 'smove' command");
+          }
+          const source = (args[1] as any).value.toString('utf8');
+          const destination = (args[2] as any).value.toString('utf8');
+          const member = (args[3] as any).value.toString('utf8');
+          const moved = this.engine.smove(source, destination, member);
+          this.lastCommandMutated = moved;
+          if (moved) {
+            this.lastMutatedKeys = source === destination ? [source] : [source, destination];
+          }
+          return RESPSerializer.encodeInteger(moved ? 1 : 0);
+        }
+
+        case 'SUNION': {
+          if (args.length < 2) {
+            return RESPSerializer.encodeError("wrong number of arguments for 'sunion' command");
+          }
+          const keys = args.slice(1).map((a: any) => a.value.toString('utf8'));
+          return RESPSerializer.encodeArray(this.engine.sunion(...keys));
+        }
+
+        case 'SINTER': {
+          if (args.length < 2) {
+            return RESPSerializer.encodeError("wrong number of arguments for 'sinter' command");
+          }
+          const keys = args.slice(1).map((a: any) => a.value.toString('utf8'));
+          return RESPSerializer.encodeArray(this.engine.sinter(...keys));
+        }
+
+        case 'SDIFF': {
+          if (args.length < 2) {
+            return RESPSerializer.encodeError("wrong number of arguments for 'sdiff' command");
+          }
+          const keys = args.slice(1).map((a: any) => a.value.toString('utf8'));
+          return RESPSerializer.encodeArray(this.engine.sdiff(keys[0], ...keys.slice(1)));
+        }
+
+        case 'SUNIONSTORE': {
+          if (args.length < 3) {
+            return RESPSerializer.encodeError("wrong number of arguments for 'sunionstore' command");
+          }
+          const dest = (args[1] as any).value.toString('utf8');
+          const keys = args.slice(2).map((a: any) => a.value.toString('utf8'));
+          return RESPSerializer.encodeInteger(this.engine.sunionstore(dest, ...keys));
+        }
+
+        case 'SINTERSTORE': {
+          if (args.length < 3) {
+            return RESPSerializer.encodeError("wrong number of arguments for 'sinterstore' command");
+          }
+          const dest = (args[1] as any).value.toString('utf8');
+          const keys = args.slice(2).map((a: any) => a.value.toString('utf8'));
+          return RESPSerializer.encodeInteger(this.engine.sinterstore(dest, ...keys));
+        }
+
+        case 'SDIFFSTORE': {
+          if (args.length < 3) {
+            return RESPSerializer.encodeError("wrong number of arguments for 'sdiffstore' command");
+          }
+          const dest = (args[1] as any).value.toString('utf8');
+          const keys = args.slice(2).map((a: any) => a.value.toString('utf8'));
+          return RESPSerializer.encodeInteger(this.engine.sdiffstore(dest, keys[0], ...keys.slice(1)));
         }
 
         // =======================
@@ -1023,6 +1299,226 @@ export class TCPServer {
           }
           const key = (args[1] as any).value.toString('utf8');
           return RESPSerializer.encodeInteger(this.engine.zcard(key));
+        }
+
+        case 'ZINCRBY': {
+          if (args.length !== 4) {
+            return RESPSerializer.encodeError("wrong number of arguments for 'zincrby' command");
+          }
+          const key = (args[1] as any).value.toString('utf8');
+          const incRaw = (args[2] as any).value.toString('utf8').trim();
+          const inc = Number(incRaw);
+          if (incRaw.length === 0 || Number.isNaN(inc)) {
+            this.lastCommandMutated = false;
+            return RESPSerializer.encodeError('value is not a valid float');
+          }
+          const member = (args[3] as any).value.toString('utf8');
+          try {
+            const next = this.engine.zincrby(key, inc, member);
+            return RESPSerializer.encodeBulkString(next.toString());
+          } catch (err: any) {
+            if (err instanceof WrongTypeError || err instanceof OOMError) throw err;
+            this.lastCommandMutated = false;
+            return RESPSerializer.encodeError(err.message);
+          }
+        }
+
+        case 'ZRANK': {
+          if (args.length !== 3) {
+            return RESPSerializer.encodeError("wrong number of arguments for 'zrank' command");
+          }
+          const key = (args[1] as any).value.toString('utf8');
+          const member = (args[2] as any).value.toString('utf8');
+          const rank = this.engine.zrank(key, member);
+          return rank === null ? RESP_CONSTANTS.NULL_BULK : RESPSerializer.encodeInteger(rank);
+        }
+
+        case 'ZREVRANK': {
+          if (args.length !== 3) {
+            return RESPSerializer.encodeError("wrong number of arguments for 'zrevrank' command");
+          }
+          const key = (args[1] as any).value.toString('utf8');
+          const member = (args[2] as any).value.toString('utf8');
+          const rank = this.engine.zrevrank(key, member);
+          return rank === null ? RESP_CONSTANTS.NULL_BULK : RESPSerializer.encodeInteger(rank);
+        }
+
+        case 'ZREVRANGE': {
+          if (args.length < 4 || args.length > 5) {
+            return RESPSerializer.encodeError("wrong number of arguments for 'zrevrange' command");
+          }
+          const key = (args[1] as any).value.toString('utf8');
+          const start = TCPServer.parseStrictInt((args[2] as any).value.toString('utf8'));
+          const stop = TCPServer.parseStrictInt((args[3] as any).value.toString('utf8'));
+          if (start === null || stop === null) {
+            return RESPSerializer.encodeError('value is not an integer or out of range');
+          }
+          let withScores = false;
+          if (args.length === 5) {
+            const flag = (args[4] as any).value.toString('utf8').toUpperCase();
+            if (flag !== 'WITHSCORES') {
+              return RESPSerializer.encodeError('syntax error');
+            }
+            withScores = true;
+          }
+          if (withScores) {
+            const list = this.engine.zrevrangeWithScores(key, start, stop);
+            const flat: string[] = [];
+            for (const item of list) {
+              flat.push(item.member, item.score.toString());
+            }
+            return RESPSerializer.encodeArray(flat);
+          }
+          return RESPSerializer.encodeArray(this.engine.zrevrange(key, start, stop));
+        }
+
+        case 'ZRANGEBYSCORE':
+        case 'ZREVRANGEBYSCORE': {
+          if (args.length < 4) {
+            return RESPSerializer.encodeError(
+              `wrong number of arguments for '${commandName.toLowerCase()}' command`
+            );
+          }
+          const isRev = commandName === 'ZREVRANGEBYSCORE';
+          const key = (args[1] as any).value.toString('utf8');
+          const minSpec = (args[isRev ? 3 : 2] as any).value.toString('utf8');
+          const maxSpec = (args[isRev ? 2 : 3] as any).value.toString('utf8');
+
+          let withScores = false;
+          let offset: number | undefined;
+          let count: number | undefined;
+
+          for (let i = 4; i < args.length; i++) {
+            const opt = (args[i] as any).value.toString('utf8').toUpperCase();
+            if (opt === 'WITHSCORES') {
+              withScores = true;
+            } else if (opt === 'LIMIT' && i + 2 < args.length) {
+              const parsedOffset = TCPServer.parseStrictInt((args[++i] as any).value.toString('utf8'));
+              const parsedCount = TCPServer.parseStrictInt((args[++i] as any).value.toString('utf8'));
+              if (parsedOffset === null || parsedCount === null) {
+                return RESPSerializer.encodeError('value is not an integer or out of range');
+              }
+              offset = parsedOffset;
+              count = parsedCount;
+            } else {
+              return RESPSerializer.encodeError('syntax error');
+            }
+          }
+
+          try {
+            const items = this.engine.zrangebyscore(key, minSpec, maxSpec, {
+              offset,
+              count,
+              reverse: isRev,
+            });
+            if (withScores) {
+              const flat: string[] = [];
+              for (const item of items) {
+                flat.push(item.member, item.score.toString());
+              }
+              return RESPSerializer.encodeArray(flat);
+            }
+            return RESPSerializer.encodeArray(items.map((x) => x.member));
+          } catch (err: any) {
+            if (err instanceof WrongTypeError) throw err;
+            return RESPSerializer.encodeError(err.message);
+          }
+        }
+
+        case 'ZCOUNT': {
+          if (args.length !== 4) {
+            return RESPSerializer.encodeError("wrong number of arguments for 'zcount' command");
+          }
+          const key = (args[1] as any).value.toString('utf8');
+          const minSpec = (args[2] as any).value.toString('utf8');
+          const maxSpec = (args[3] as any).value.toString('utf8');
+          try {
+            return RESPSerializer.encodeInteger(this.engine.zcount(key, minSpec, maxSpec));
+          } catch (err: any) {
+            if (err instanceof WrongTypeError) throw err;
+            return RESPSerializer.encodeError(err.message);
+          }
+        }
+
+        case 'ZPOPMIN':
+        case 'ZPOPMAX': {
+          if (args.length < 2 || args.length > 3) {
+            return RESPSerializer.encodeError(
+              `wrong number of arguments for '${commandName.toLowerCase()}' command`
+            );
+          }
+          const key = (args[1] as any).value.toString('utf8');
+          let count = 1;
+          if (args.length === 3) {
+            const parsedCount = TCPServer.parseStrictInt((args[2] as any).value.toString('utf8'));
+            if (parsedCount === null || parsedCount < 0) {
+              this.lastCommandMutated = false;
+              return RESPSerializer.encodeError('value is out of range, must be positive');
+            }
+            count = parsedCount;
+          }
+          const popped =
+            commandName === 'ZPOPMIN'
+              ? this.engine.zpopmin(key, count)
+              : this.engine.zpopmax(key, count);
+          this.lastCommandMutated = popped.length > 0;
+          const flat: string[] = [];
+          for (const item of popped) {
+            flat.push(item.member, item.score.toString());
+          }
+          return RESPSerializer.encodeArray(flat);
+        }
+
+        case 'ZMPOP': {
+          if (args.length < 4) {
+            return RESPSerializer.encodeError("wrong number of arguments for 'zmpop' command");
+          }
+          const numKeys = TCPServer.parseStrictInt((args[1] as any).value.toString('utf8'));
+          if (numKeys === null || numKeys <= 0) {
+            this.lastCommandMutated = false;
+            return RESPSerializer.encodeError('numkeys should be greater than 0');
+          }
+          if (args.length < 2 + numKeys + 1) {
+            this.lastCommandMutated = false;
+            return RESPSerializer.encodeError('syntax error');
+          }
+          const keys = args.slice(2, 2 + numKeys).map((a: any) => a.value.toString('utf8'));
+          const dirToken = (args[2 + numKeys] as any).value.toString('utf8').toUpperCase();
+          if (dirToken !== 'MIN' && dirToken !== 'MAX') {
+            this.lastCommandMutated = false;
+            return RESPSerializer.encodeError('syntax error');
+          }
+
+          let count = 1;
+          const afterDir = 2 + numKeys + 1;
+          if (afterDir < args.length) {
+            if (
+              afterDir + 1 !== args.length - 1 ||
+              (args[afterDir] as any).value.toString('utf8').toUpperCase() !== 'COUNT'
+            ) {
+              this.lastCommandMutated = false;
+              return RESPSerializer.encodeError('syntax error');
+            }
+            const parsedCount = TCPServer.parseStrictInt(
+              (args[afterDir + 1] as any).value.toString('utf8')
+            );
+            if (parsedCount === null || parsedCount <= 0) {
+              this.lastCommandMutated = false;
+              return RESPSerializer.encodeError('count should be greater than 0');
+            }
+            count = parsedCount;
+          }
+
+          const popped = this.engine.zmpop(keys, dirToken, count);
+          if (popped === null) {
+            this.lastCommandMutated = false;
+            return RESP_CONSTANTS.NULL_ARRAY;
+          }
+          this.lastMutatedKeys = [popped.key];
+          return RESPSerializer.encodeArray([
+            popped.key,
+            popped.elements.map((e) => [e.member, e.score.toString()]),
+          ]);
         }
 
         // =======================
