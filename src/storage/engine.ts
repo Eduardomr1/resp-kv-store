@@ -826,6 +826,121 @@ export class StorageEngine {
     return (entry.data.value as Map<string, Buffer>).size;
   }
 
+  public hsetnx(key: string, field: string, value: Buffer | string): boolean {
+    const entry = this.store.get(key);
+    if (entry && !this.isExpired(key, entry)) {
+      if (entry.data.type !== 'hash') throw new WrongTypeError();
+      if ((entry.data.value as Map<string, Buffer>).has(field)) {
+        return false;
+      }
+    }
+    this.hset(key, field, value);
+    return true;
+  }
+
+  public hincrby(key: string, field: string, increment: number | bigint | string): number | bigint {
+    const delta =
+      typeof increment === 'bigint'
+        ? increment
+        : parseSignedInt64(increment.toString());
+
+    let entry = this.store.get(key);
+    if (entry && this.isExpired(key, entry)) {
+      entry = undefined;
+    }
+
+    let current = 0n;
+    if (entry) {
+      if (entry.data.type !== 'hash') throw new WrongTypeError();
+      const existingField = (entry.data.value as Map<string, Buffer>).get(field);
+      if (existingField !== undefined) {
+        try {
+          current = parseSignedInt64(existingField.toString('utf8'));
+        } catch {
+          throw new Error('ERR hash value is not an integer');
+        }
+      }
+    }
+
+    const next = current + delta;
+    if (next < MIN_INT64 || next > MAX_INT64) {
+      throw new Error('ERR increment or decrement would overflow');
+    }
+
+    if (entry) {
+      const prev = (entry.data.value as Map<string, Buffer>).get(field);
+      if (prev) {
+        this.statsCounters.memoryEstimateBytes = Math.max(
+          0,
+          this.statsCounters.memoryEstimateBytes - (Buffer.byteLength(field) + prev.length + 32)
+        );
+      }
+    }
+
+    this.hset(key, field, Buffer.from(next.toString(), 'ascii'));
+    const asNum = Number(next);
+    return Number.isSafeInteger(asNum) ? asNum : next;
+  }
+
+  public hstrlen(key: string, field: string): number {
+    const val = this.hget(key, field);
+    return val ? val.length : 0;
+  }
+
+  public hrandfield(
+    key: string,
+    count?: number,
+    withValues: boolean = false
+  ): string | (string | Buffer)[] | null {
+    const entry = this.store.get(key);
+    if (!entry || this.isExpired(key, entry)) {
+      return count === undefined ? null : [];
+    }
+    if (entry.data.type !== 'hash') throw new WrongTypeError();
+    this.recordAccess(entry);
+
+    const entries = Array.from((entry.data.value as Map<string, Buffer>).entries());
+    if (entries.length === 0) {
+      return count === undefined ? null : [];
+    }
+
+    if (count === undefined) {
+      const idx = Math.floor(Math.random() * entries.length);
+      return entries[idx][0];
+    }
+
+    if (count === 0) {
+      return [];
+    }
+
+    const result: (string | Buffer)[] = [];
+    if (count > 0) {
+      const pool = [...entries];
+      const limit = Math.min(count, pool.length);
+      for (let i = 0; i < limit; i++) {
+        const randIdx = i + Math.floor(Math.random() * (pool.length - i));
+        const tmp = pool[i];
+        pool[i] = pool[randIdx];
+        pool[randIdx] = tmp;
+        result.push(pool[i][0]);
+        if (withValues) {
+          result.push(pool[i][1]);
+        }
+      }
+    } else {
+      const total = Math.abs(count);
+      for (let i = 0; i < total; i++) {
+        const randIdx = Math.floor(Math.random() * entries.length);
+        result.push(entries[randIdx][0]);
+        if (withValues) {
+          result.push(entries[randIdx][1]);
+        }
+      }
+    }
+
+    return result;
+  }
+
   // ==========================================
   // LIST OPERATIONS
   // ==========================================
@@ -966,6 +1081,104 @@ export class StorageEngine {
     if (!entry || this.isExpired(key, entry)) return 0;
     if (entry.data.type !== 'list') throw new WrongTypeError();
     return (entry.data.value as Buffer[]).length;
+  }
+
+  public lindex(key: string, index: number): Buffer | null {
+    const entry = this.store.get(key);
+    if (!entry || this.isExpired(key, entry)) return null;
+    if (entry.data.type !== 'list') throw new WrongTypeError();
+    this.recordAccess(entry);
+
+    const list = entry.data.value as Buffer[];
+    const resolved = index < 0 ? list.length + index : index;
+    if (resolved < 0 || resolved >= list.length) return null;
+    return list[resolved];
+  }
+
+  public lset(key: string, index: number, value: Buffer | string): void {
+    const entry = this.store.get(key);
+    if (!entry || this.isExpired(key, entry)) {
+      throw new Error('ERR no such key');
+    }
+    if (entry.data.type !== 'list') throw new WrongTypeError();
+
+    const list = entry.data.value as Buffer[];
+    const resolved = index < 0 ? list.length + index : index;
+    if (resolved < 0 || resolved >= list.length) {
+      throw new Error('ERR index out of range');
+    }
+
+    const buf = Buffer.isBuffer(value) ? value : Buffer.from(value, 'utf8');
+    const prev = list[resolved];
+    this.statsCounters.memoryEstimateBytes += buf.length - prev.length;
+    list[resolved] = buf;
+    entry.updatedAt = Date.now();
+    this.recordAccess(entry);
+    this.logAOF(['LSET', key, resolved.toString(), buf]);
+  }
+
+  public ltrim(key: string, start: number, stop: number): void {
+    const entry = this.store.get(key);
+    if (!entry || this.isExpired(key, entry)) return;
+    if (entry.data.type !== 'list') throw new WrongTypeError();
+
+    const list = entry.data.value as Buffer[];
+    const len = list.length;
+    if (len === 0) return;
+
+    let startIdx = start < 0 ? len + start : start;
+    let stopIdx = stop < 0 ? len + stop : stop;
+
+    if (startIdx < 0) startIdx = 0;
+    if (stopIdx >= len) stopIdx = len - 1;
+
+    if (startIdx > stopIdx || startIdx >= len) {
+      this.deleteInternal(key, true);
+      this.logAOF(['DEL', key]);
+      return;
+    }
+
+    const kept = list.slice(startIdx, stopIdx + 1);
+    let reclaimed = 0;
+    for (let i = 0; i < startIdx; i++) reclaimed += list[i].length + 16;
+    for (let i = stopIdx + 1; i < len; i++) reclaimed += list[i].length + 16;
+
+    this.statsCounters.memoryEstimateBytes = Math.max(
+      0,
+      this.statsCounters.memoryEstimateBytes - reclaimed
+    );
+    entry.data.value = kept;
+    entry.updatedAt = Date.now();
+    this.logAOF(['LTRIM', key, start.toString(), stop.toString()]);
+  }
+
+  public lmove(
+    source: string,
+    destination: string,
+    whereFrom: 'LEFT' | 'RIGHT',
+    whereTo: 'LEFT' | 'RIGHT'
+  ): Buffer | null {
+    const srcEntry = this.store.get(source);
+    if (!srcEntry || this.isExpired(source, srcEntry)) return null;
+    if (srcEntry.data.type !== 'list') throw new WrongTypeError();
+
+    if (source !== destination) {
+      const dstEntry = this.store.get(destination);
+      if (dstEntry && !this.isExpired(destination, dstEntry) && dstEntry.data.type !== 'list') {
+        throw new WrongTypeError();
+      }
+    }
+
+    const popped =
+      whereFrom === 'LEFT' ? (this.lpop(source, 1) as Buffer | null) : (this.rpop(source, 1) as Buffer | null);
+    if (popped === null) return null;
+
+    if (whereTo === 'LEFT') {
+      this.lpush(destination, popped);
+    } else {
+      this.rpush(destination, popped);
+    }
+    return popped;
   }
 
   // ==========================================
@@ -1622,6 +1835,15 @@ export class StorageEngine {
       const key = args[1].toString('utf8');
       const count = args.length >= 3 ? parseInt(args[2].toString('utf8'), 10) : 1;
       this.rpop(key, count);
+    } else if (cmd === 'LSET' && args.length >= 4) {
+      const key = args[1].toString('utf8');
+      const idx = parseInt(args[2].toString('utf8'), 10);
+      this.lset(key, idx, args[3]);
+    } else if (cmd === 'LTRIM' && args.length >= 4) {
+      const key = args[1].toString('utf8');
+      const start = parseInt(args[2].toString('utf8'), 10);
+      const stop = parseInt(args[3].toString('utf8'), 10);
+      this.ltrim(key, start, stop);
     } else if (cmd === 'SREM' && args.length >= 3) {
       const key = args[1].toString('utf8');
       const members = args.slice(2).map((b) => b.toString('utf8'));
