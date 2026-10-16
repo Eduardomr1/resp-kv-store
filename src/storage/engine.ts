@@ -1,4 +1,4 @@
-import { SkipList } from './skiplist.ts';
+import { SkipList, parseScoreBound, type ScoreRangeOptions } from './skiplist.ts';
 import { RedisStream, type StreamEntry } from './stream.ts';
 import { BitmapHelper } from './bitmap.ts';
 import { HyperLogLog } from './hll.ts';
@@ -1561,6 +1561,146 @@ export class StorageEngine {
 
     const zsetData = entry.data as { type: 'zset'; value: SkipList; memberScores: Map<string, number> };
     return zsetData.value.size;
+  }
+
+  public zincrby(key: string, increment: number, member: string): number {
+    if (Number.isNaN(increment)) {
+      throw new Error('ERR value is not a valid float');
+    }
+    const current = this.zscore(key, member) ?? 0;
+    const next = current + increment;
+    if (Number.isNaN(next)) {
+      throw new Error('ERR resulting score is not a number (NaN)');
+    }
+    this.zadd(key, next, member);
+    return next;
+  }
+
+  public zrank(key: string, member: string): number | null {
+    const entry = this.store.get(key);
+    if (!entry || this.isExpired(key, entry)) return null;
+    if (entry.data.type !== 'zset') throw new WrongTypeError();
+    this.recordAccess(entry);
+
+    const zsetData = entry.data as { type: 'zset'; value: SkipList; memberScores: Map<string, number> };
+    const score = zsetData.memberScores.get(member);
+    if (score === undefined) return null;
+    return zsetData.value.getRank(member, score);
+  }
+
+  public zrevrank(key: string, member: string): number | null {
+    const ascRank = this.zrank(key, member);
+    if (ascRank === null) return null;
+    return this.zcard(key) - 1 - ascRank;
+  }
+
+  public zrevrangeWithScores(
+    key: string,
+    start: number,
+    stop: number
+  ): Array<{ member: string; score: number }> {
+    const entry = this.store.get(key);
+    if (!entry || this.isExpired(key, entry)) return [];
+    if (entry.data.type !== 'zset') throw new WrongTypeError();
+    this.recordAccess(entry);
+
+    const zsetData = entry.data as { type: 'zset'; value: SkipList; memberScores: Map<string, number> };
+    const len = zsetData.value.size;
+    if (len === 0) return [];
+
+    let startIdx = start < 0 ? len + start : start;
+    let stopIdx = stop < 0 ? len + stop : stop;
+    if (startIdx < 0) startIdx = 0;
+    if (stopIdx >= len) stopIdx = len - 1;
+    if (startIdx > stopIdx) return [];
+
+    const ascStart = len - 1 - stopIdx;
+    const ascStop = len - 1 - startIdx;
+    return zsetData.value.getRange(ascStart, ascStop).reverse();
+  }
+
+  public zrevrange(key: string, start: number, stop: number): string[] {
+    return this.zrevrangeWithScores(key, start, stop).map((e) => e.member);
+  }
+
+  public zrangebyscore(
+    key: string,
+    minSpec: string,
+    maxSpec: string,
+    options: ScoreRangeOptions = {}
+  ): Array<{ member: string; score: number }> {
+    const min = parseScoreBound(minSpec);
+    const max = parseScoreBound(maxSpec);
+
+    const entry = this.store.get(key);
+    if (!entry || this.isExpired(key, entry)) return [];
+    if (entry.data.type !== 'zset') throw new WrongTypeError();
+    this.recordAccess(entry);
+
+    const zsetData = entry.data as { type: 'zset'; value: SkipList; memberScores: Map<string, number> };
+    return zsetData.value.getRangeByScore(min, max, options);
+  }
+
+  public zcount(key: string, minSpec: string, maxSpec: string): number {
+    const min = parseScoreBound(minSpec);
+    const max = parseScoreBound(maxSpec);
+
+    const entry = this.store.get(key);
+    if (!entry || this.isExpired(key, entry)) return 0;
+    if (entry.data.type !== 'zset') throw new WrongTypeError();
+    this.recordAccess(entry);
+
+    const zsetData = entry.data as { type: 'zset'; value: SkipList; memberScores: Map<string, number> };
+    return zsetData.value.countByScore(min, max);
+  }
+
+  public zpopmin(key: string, count: number = 1): Array<{ member: string; score: number }> {
+    const entry = this.store.get(key);
+    if (!entry || this.isExpired(key, entry)) return [];
+    if (entry.data.type !== 'zset') throw new WrongTypeError();
+    if (count <= 0) return [];
+
+    const zsetData = entry.data as { type: 'zset'; value: SkipList; memberScores: Map<string, number> };
+    const items = zsetData.value.getRange(0, count - 1);
+    if (items.length > 0) {
+      this.zrem(key, ...items.map((x) => x.member));
+    }
+    return items;
+  }
+
+  public zpopmax(key: string, count: number = 1): Array<{ member: string; score: number }> {
+    const entry = this.store.get(key);
+    if (!entry || this.isExpired(key, entry)) return [];
+    if (entry.data.type !== 'zset') throw new WrongTypeError();
+    if (count <= 0) return [];
+
+    const items = this.zrevrangeWithScores(key, 0, count - 1);
+    if (items.length > 0) {
+      this.zrem(key, ...items.map((x) => x.member));
+    }
+    return items;
+  }
+
+  public zmpop(
+    keys: string[],
+    direction: 'MIN' | 'MAX',
+    count: number = 1
+  ): { key: string; elements: Array<{ member: string; score: number }> } | null {
+    if (count <= 0) {
+      throw new Error('ERR count should be greater than 0');
+    }
+    for (const key of keys) {
+      const entry = this.store.get(key);
+      if (!entry || this.isExpired(key, entry)) continue;
+      if (entry.data.type !== 'zset') throw new WrongTypeError();
+
+      const elements =
+        direction === 'MIN' ? this.zpopmin(key, count) : this.zpopmax(key, count);
+      if (elements.length > 0) {
+        return { key, elements };
+      }
+    }
+    return null;
   }
 
   // ==========================================
