@@ -1265,6 +1265,189 @@ export class StorageEngine {
     return (entry.data.value as Set<string>).size;
   }
 
+  public smismember(key: string, members: string[]): number[] {
+    const entry = this.store.get(key);
+    if (!entry || this.isExpired(key, entry)) {
+      return members.map(() => 0);
+    }
+    if (entry.data.type !== 'set') throw new WrongTypeError();
+    this.recordAccess(entry);
+    const set = entry.data.value as Set<string>;
+    return members.map((m) => (set.has(m) ? 1 : 0));
+  }
+
+  public srandmember(key: string, count?: number): string | string[] | null {
+    const entry = this.store.get(key);
+    if (!entry || this.isExpired(key, entry)) {
+      return count === undefined ? null : [];
+    }
+    if (entry.data.type !== 'set') throw new WrongTypeError();
+    this.recordAccess(entry);
+
+    const items = Array.from((entry.data.value as Set<string>).values());
+    if (items.length === 0) {
+      return count === undefined ? null : [];
+    }
+
+    if (count === undefined) {
+      return items[Math.floor(Math.random() * items.length)];
+    }
+
+    if (count === 0) return [];
+
+    if (count > 0) {
+      const pool = [...items];
+      const limit = Math.min(count, pool.length);
+      for (let i = 0; i < limit; i++) {
+        const randIdx = i + Math.floor(Math.random() * (pool.length - i));
+        const tmp = pool[i];
+        pool[i] = pool[randIdx];
+        pool[randIdx] = tmp;
+      }
+      return pool.slice(0, limit);
+    }
+
+    const total = Math.abs(count);
+    const result: string[] = [];
+    for (let i = 0; i < total; i++) {
+      result.push(items[Math.floor(Math.random() * items.length)]);
+    }
+    return result;
+  }
+
+  public spop(key: string, count?: number): string | string[] | null {
+    if (count !== undefined && count < 0) {
+      throw new Error('ERR value is out of range, must be positive');
+    }
+    const entry = this.store.get(key);
+    if (!entry || this.isExpired(key, entry)) {
+      return count === undefined ? null : [];
+    }
+    if (entry.data.type !== 'set') throw new WrongTypeError();
+
+    if (count === undefined) {
+      const picked = this.srandmember(key) as string | null;
+      if (picked === null) return null;
+      this.srem(key, picked);
+      return picked;
+    }
+
+    if (count === 0) return [];
+    const pickedList = this.srandmember(key, count) as string[];
+    if (pickedList.length > 0) {
+      this.srem(key, ...pickedList);
+    }
+    return pickedList;
+  }
+
+  public smove(source: string, destination: string, member: string): boolean {
+    const srcEntry = this.store.get(source);
+    if (!srcEntry || this.isExpired(source, srcEntry)) return false;
+    if (srcEntry.data.type !== 'set') throw new WrongTypeError();
+
+    const dstEntry = this.store.get(destination);
+    if (dstEntry && !this.isExpired(destination, dstEntry) && dstEntry.data.type !== 'set') {
+      throw new WrongTypeError();
+    }
+
+    const srcSet = srcEntry.data.value as Set<string>;
+    if (!srcSet.has(member)) return false;
+    if (source === destination) return true;
+
+    this.srem(source, member);
+    this.sadd(destination, member);
+    return true;
+  }
+
+  private getValidatedSet(key: string): Set<string> | null {
+    const entry = this.store.get(key);
+    if (!entry || this.isExpired(key, entry)) return null;
+    if (entry.data.type !== 'set') throw new WrongTypeError();
+    this.recordAccess(entry);
+    return entry.data.value as Set<string>;
+  }
+
+  public sunion(...keys: string[]): string[] {
+    const sets = keys.map((k) => this.getValidatedSet(k));
+    const union = new Set<string>();
+    for (const s of sets) {
+      if (s) {
+        for (const m of s) union.add(m);
+      }
+    }
+    return Array.from(union);
+  }
+
+  public sinter(...keys: string[]): string[] {
+    if (keys.length === 0) return [];
+    const sets = keys.map((k) => this.getValidatedSet(k));
+    for (const s of sets) {
+      if (!s || s.size === 0) return [];
+    }
+
+    const nonNull = (sets as Set<string>[]).slice().sort((a, b) => a.size - b.size);
+    const smallest = nonNull[0];
+    const result: string[] = [];
+
+    for (const candidate of smallest) {
+      let inAll = true;
+      for (let i = 1; i < nonNull.length; i++) {
+        if (!nonNull[i].has(candidate)) {
+          inAll = false;
+          break;
+        }
+      }
+      if (inAll) result.push(candidate);
+    }
+    return result;
+  }
+
+  public sdiff(firstKey: string, ...otherKeys: string[]): string[] {
+    const base = this.getValidatedSet(firstKey);
+    const others = otherKeys.map((k) => this.getValidatedSet(k));
+    if (!base || base.size === 0) return [];
+
+    const result: string[] = [];
+    for (const candidate of base) {
+      let excluded = false;
+      for (const s of others) {
+        if (s && s.has(candidate)) {
+          excluded = true;
+          break;
+        }
+      }
+      if (!excluded) result.push(candidate);
+    }
+    return result;
+  }
+
+  public sunionstore(destination: string, ...keys: string[]): number {
+    const members = this.sunion(...keys);
+    this.del(destination);
+    if (members.length > 0) {
+      this.sadd(destination, ...members);
+    }
+    return members.length;
+  }
+
+  public sinterstore(destination: string, ...keys: string[]): number {
+    const members = this.sinter(...keys);
+    this.del(destination);
+    if (members.length > 0) {
+      this.sadd(destination, ...members);
+    }
+    return members.length;
+  }
+
+  public sdiffstore(destination: string, firstKey: string, ...otherKeys: string[]): number {
+    const members = this.sdiff(firstKey, ...otherKeys);
+    this.del(destination);
+    if (members.length > 0) {
+      this.sadd(destination, ...members);
+    }
+    return members.length;
+  }
+
   // ==========================================
   // SORTED SET OPERATIONS (SKIPLIST)
   // ==========================================
