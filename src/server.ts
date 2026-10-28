@@ -1522,6 +1522,94 @@ export class TCPServer {
         }
 
         // =======================
+        // GEOSPATIAL (GEO)
+        // =======================
+        case 'GEOADD': {
+          if (args.length < 5 || (args.length - 2) % 3 !== 0) {
+            this.lastCommandMutated = false;
+            return RESPSerializer.encodeError("wrong number of arguments for 'geoadd' command");
+          }
+          const key = (args[1] as any).value.toString('utf8');
+          const items: Array<{ longitude: number; latitude: number; member: string }> = [];
+          for (let i = 2; i < args.length; i += 3) {
+            const lon = Number((args[i] as any).value.toString('utf8'));
+            const lat = Number((args[i + 1] as any).value.toString('utf8'));
+            if (isNaN(lon) || isNaN(lat)) {
+              this.lastCommandMutated = false;
+              return RESPSerializer.encodeError('value is not a valid float');
+            }
+            const member = (args[i + 2] as any).value.toString('utf8');
+            items.push({ longitude: lon, latitude: lat, member });
+          }
+          try {
+            const added = this.engine.geoadd(key, items);
+            this.lastMutatedKeys = [key];
+            return RESPSerializer.encodeInteger(added);
+          } catch (err: any) {
+            this.lastCommandMutated = false;
+            return RESPSerializer.encodeError(err.message);
+          }
+        }
+
+        case 'GEOPOS': {
+          if (args.length < 3) {
+            this.lastCommandMutated = false;
+            return RESPSerializer.encodeError("wrong number of arguments for 'geopos' command");
+          }
+          this.lastCommandMutated = false;
+          const key = (args[1] as any).value.toString('utf8');
+          const members = args.slice(2).map((a: any) => a.value.toString('utf8'));
+          const positions = this.engine.geopos(key, members);
+          const out = positions.map((pos) => {
+            if (!pos) return null;
+            return [pos.longitude.toString(), pos.latitude.toString()];
+          });
+          return RESPSerializer.encodeArray(out as any);
+        }
+
+        case 'GEODIST': {
+          if (args.length < 4 || args.length > 5) {
+            this.lastCommandMutated = false;
+            return RESPSerializer.encodeError("wrong number of arguments for 'geodist' command");
+          }
+          this.lastCommandMutated = false;
+          const key = (args[1] as any).value.toString('utf8');
+          const m1 = (args[2] as any).value.toString('utf8');
+          const m2 = (args[3] as any).value.toString('utf8');
+          const unit = args.length === 5 ? (args[4] as any).value.toString('utf8').toLowerCase() : 'm';
+          const dist = this.engine.geodist(key, m1, m2, unit as any);
+          if (dist === null) return RESP_CONSTANTS.NULL_BULK;
+          return RESPSerializer.encodeBulkString(dist.toFixed(4));
+        }
+
+        case 'GEOSEARCH': {
+          if (args.length < 6) {
+            this.lastCommandMutated = false;
+            return RESPSerializer.encodeError("wrong number of arguments for 'geosearch' command");
+          }
+          this.lastCommandMutated = false;
+          const key = (args[1] as any).value.toString('utf8');
+          let centerLon = 0;
+          let centerLat = 0;
+          let radius = 0;
+          let unit = 'm';
+          for (let i = 2; i < args.length; i++) {
+            const token = (args[i] as any).value.toString('utf8').toUpperCase();
+            if (token === 'FROMLONLAT' && i + 2 < args.length) {
+              centerLon = Number((args[i + 1] as any).value.toString('utf8'));
+              centerLat = Number((args[i + 2] as any).value.toString('utf8'));
+              i += 2;
+            } else if (token === 'BYRADIUS' && i + 2 < args.length) {
+              radius = Number((args[i + 1] as any).value.toString('utf8'));
+              unit = (args[i + 2] as any).value.toString('utf8').toLowerCase();
+              i += 2;
+            }
+          }
+          const results = this.engine.geosearch(key, { longitude: centerLon, latitude: centerLat }, radius, unit as any);
+          return RESPSerializer.encodeArray(results.map((r) => r.member));
+        }
+
+        // =======================
         // KEY & DB MANAGEMENT
         // =======================
         case 'DEL': {
