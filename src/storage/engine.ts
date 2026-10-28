@@ -2440,7 +2440,7 @@ export class StorageEngine {
     if (s1 === null || s2 === null) return null;
     const c1 = decodeGeohash52(s1);
     const c2 = decodeGeohash52(s2);
-    const meters = haversineDistanceMeters(c1, c2);
+    const meters = haversineDistanceMeters(c1.longitude, c1.latitude, c2.longitude, c2.latitude);
     return fromMeters(meters, unit);
   }
 
@@ -2458,20 +2458,30 @@ export class StorageEngine {
       throw new WrongTypeError('WRONGTYPE Operation against a key holding the wrong kind of value');
     }
     const radiusMeters = toMeters(radius, unit);
-    const windows = computeGeohashSearchWindows(center.longitude, center.latitude, radiusMeters);
-    const skiplist = entry.data.skiplist;
+    const windows = computeGeohashSearchWindows(
+      center.longitude,
+      center.latitude,
+      radiusMeters * 2,
+      radiusMeters * 2
+    );
+    const skiplist = (entry.data as { value: SkipList }).value;
 
     const matchedMap = new Map<string, { member: string; distance: number; coordinates: GeoCoordinates }>();
 
     for (const win of windows) {
-      const candidates = skiplist.getRangeByScore({
-        min: { value: win.minScore, inclusive: true },
-        max: { value: win.maxScore, inclusive: true },
-      });
+      const candidates = skiplist.getRangeByScore(
+        { value: win.minScore, inclusive: true },
+        { value: win.maxScore, inclusive: true }
+      );
       for (const item of candidates) {
         if (matchedMap.has(item.member)) continue;
         const coords = decodeGeohash52(item.score);
-        const distMeters = haversineDistanceMeters(center, coords);
+        const distMeters = haversineDistanceMeters(
+          center.longitude,
+          center.latitude,
+          coords.longitude,
+          coords.latitude
+        );
         if (distMeters <= radiusMeters) {
           matchedMap.set(item.member, {
             member: item.member,
