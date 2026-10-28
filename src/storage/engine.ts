@@ -4,6 +4,18 @@ import { BitmapHelper } from './bitmap.ts';
 import { HyperLogLog } from './hll.ts';
 import { AOFManager } from './aof.ts';
 import {
+  validateCoordinates,
+  encodeGeohash52,
+  decodeGeohash52,
+  haversineDistanceMeters,
+  toMeters,
+  fromMeters,
+  parseGeoUnit,
+  computeGeohashSearchWindows,
+  type GeoUnit,
+  type GeoCoordinates,
+} from './geo.ts';
+import {
   type StorageEntry,
   type StorageData,
   type RedisDataType,
@@ -2394,5 +2406,93 @@ export class StorageEngine {
     }
     regStr += '$';
     return new RegExp(regStr);
+  }
+
+  public geoadd(
+    key: string,
+    items: Array<{ longitude: number; latitude: number; member: string }>
+  ): number {
+    let added = 0;
+    for (const item of items) {
+      validateCoordinates(item.longitude, item.latitude);
+      const score = encodeGeohash52(item.longitude, item.latitude);
+      added += this.zadd(key, score, item.member);
+    }
+    return added;
+  }
+
+  public geopos(key: string, members: string[]): Array<GeoCoordinates | null> {
+    return members.map((m) => {
+      const score = this.zscore(key, m);
+      if (score === null) return null;
+      return decodeGeohash52(score);
+    });
+  }
+
+  public geodist(
+    key: string,
+    member1: string,
+    member2: string,
+    unit: GeoUnit = 'm'
+  ): number | null {
+    const s1 = this.zscore(key, member1);
+    const s2 = this.zscore(key, member2);
+    if (s1 === null || s2 === null) return null;
+    const c1 = decodeGeohash52(s1);
+    const c2 = decodeGeohash52(s2);
+    const meters = haversineDistanceMeters(c1, c2);
+    return fromMeters(meters, unit);
+  }
+
+  public geosearch(
+    key: string,
+    center: GeoCoordinates,
+    radius: number,
+    unit: GeoUnit = 'm',
+    options?: { withDist?: boolean; withCoord?: boolean; count?: number; sort?: 'ASC' | 'DESC' }
+  ): Array<{ member: string; distance?: number; coordinates?: GeoCoordinates }> {
+    const entry = this.store.get(key);
+    if (!entry) return [];
+    if (this.isExpired(key, entry)) return [];
+    if (entry.data.type !== 'zset') {
+      throw new WrongTypeError('WRONGTYPE Operation against a key holding the wrong kind of value');
+    }
+    const radiusMeters = toMeters(radius, unit);
+    const windows = computeGeohashSearchWindows(center.longitude, center.latitude, radiusMeters);
+    const skiplist = entry.data.skiplist;
+
+    const matchedMap = new Map<string, { member: string; distance: number; coordinates: GeoCoordinates }>();
+
+    for (const win of windows) {
+      const candidates = skiplist.getRangeByScore({
+        min: { value: win.minScore, inclusive: true },
+        max: { value: win.maxScore, inclusive: true },
+      });
+      for (const item of candidates) {
+        if (matchedMap.has(item.member)) continue;
+        const coords = decodeGeohash52(item.score);
+        const distMeters = haversineDistanceMeters(center, coords);
+        if (distMeters <= radiusMeters) {
+          matchedMap.set(item.member, {
+            member: item.member,
+            distance: fromMeters(distMeters, unit),
+            coordinates: coords,
+          });
+        }
+      }
+    }
+
+    let results = Array.from(matchedMap.values());
+    if (options?.sort === 'ASC') {
+      results.sort((a, b) => a.distance - b.distance);
+    } else if (options?.sort === 'DESC') {
+      results.sort((a, b) => b.distance - a.distance);
+    }
+
+    if (options?.count && options.count > 0) {
+      results = results.slice(0, options.count);
+    }
+
+    return results;
   }
 }
