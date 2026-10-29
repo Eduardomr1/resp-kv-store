@@ -1610,6 +1610,118 @@ export class TCPServer {
         }
 
         // =======================
+        // BLOOM FILTER (BF)
+        // =======================
+        case 'BF.RESERVE': {
+          if (args.length < 4) {
+            this.lastCommandMutated = false;
+            return RESPSerializer.encodeError("wrong number of arguments for 'bf.reserve' command");
+          }
+          const key = (args[1] as any).value.toString('utf8');
+          const errorRate = Number((args[2] as any).value.toString('utf8'));
+          const capacity = Number((args[3] as any).value.toString('utf8'));
+          if (isNaN(errorRate) || isNaN(capacity)) {
+            this.lastCommandMutated = false;
+            return RESPSerializer.encodeError('value is not a valid float or integer');
+          }
+          try {
+            this.engine.bfReserve(key, errorRate, capacity);
+            this.lastMutatedKeys = [key];
+            return RESPSerializer.encodeSimpleString('OK');
+          } catch (err: any) {
+            this.lastCommandMutated = false;
+            return RESPSerializer.encodeError(err.message);
+          }
+        }
+
+        case 'BF.ADD': {
+          if (args.length < 3) {
+            this.lastCommandMutated = false;
+            return RESPSerializer.encodeError("wrong number of arguments for 'bf.add' command");
+          }
+          const key = (args[1] as any).value.toString('utf8');
+          const item = (args[2] as any).value.toString('utf8');
+          try {
+            const added = this.engine.bfAdd(key, item);
+            this.lastMutatedKeys = [key];
+            return RESPSerializer.encodeInteger(added ? 1 : 0);
+          } catch (err: any) {
+            this.lastCommandMutated = false;
+            return RESPSerializer.encodeError(err.message);
+          }
+        }
+
+        case 'BF.MADD': {
+          if (args.length < 3) {
+            this.lastCommandMutated = false;
+            return RESPSerializer.encodeError("wrong number of arguments for 'bf.madd' command");
+          }
+          const key = (args[1] as any).value.toString('utf8');
+          const results: number[] = [];
+          for (let i = 2; i < args.length; i++) {
+            const item = (args[i] as any).value.toString('utf8');
+            const added = this.engine.bfAdd(key, item);
+            results.push(added ? 1 : 0);
+          }
+          this.lastMutatedKeys = [key];
+          return RESPSerializer.encodeArray(results);
+        }
+
+        case 'BF.EXISTS': {
+          if (args.length < 3) {
+            this.lastCommandMutated = false;
+            return RESPSerializer.encodeError("wrong number of arguments for 'bf.exists' command");
+          }
+          this.lastCommandMutated = false;
+          const key = (args[1] as any).value.toString('utf8');
+          const item = (args[2] as any).value.toString('utf8');
+          try {
+            const exists = this.engine.bfExists(key, item);
+            return RESPSerializer.encodeInteger(exists ? 1 : 0);
+          } catch (err: any) {
+            return RESPSerializer.encodeError(err.message);
+          }
+        }
+
+        case 'BF.MEXISTS': {
+          if (args.length < 3) {
+            this.lastCommandMutated = false;
+            return RESPSerializer.encodeError("wrong number of arguments for 'bf.mexists' command");
+          }
+          this.lastCommandMutated = false;
+          const key = (args[1] as any).value.toString('utf8');
+          const results: number[] = [];
+          try {
+            for (let i = 2; i < args.length; i++) {
+              const item = (args[i] as any).value.toString('utf8');
+              results.push(this.engine.bfExists(key, item) ? 1 : 0);
+            }
+            return RESPSerializer.encodeArray(results);
+          } catch (err: any) {
+            return RESPSerializer.encodeError(err.message);
+          }
+        }
+
+        case 'BF.INFO': {
+          if (args.length < 2) {
+            this.lastCommandMutated = false;
+            return RESPSerializer.encodeError("wrong number of arguments for 'bf.info' command");
+          }
+          this.lastCommandMutated = false;
+          const key = (args[1] as any).value.toString('utf8');
+          const info = this.engine.bfInfo(key);
+          if (!info) return RESPSerializer.encodeError('ERR not found');
+          return RESPSerializer.encodeArray([
+            'Capacity',
+            info.capacity,
+            'Size',
+            info.size,
+            'Number of items inserted',
+            info.numberOfItemsInserted,
+          ]);
+        }
+
+        // =======================
         // KEY & DB MANAGEMENT
         // =======================
         case 'DEL': {
