@@ -5,7 +5,7 @@
   "type": "module",
   "scripts": {
     "start": "node --experimental-strip-types src/index.ts",
-    "test": "node --experimental-strip-types --test tests/resp.test.ts tests/storage.test.ts tests/strings_ttl.test.ts tests/skiplist.test.ts tests/polymorphic.test.ts tests/collections_ext.test.ts tests/aof.test.ts tests/transactions.test.ts tests/pubsub.test.ts tests/integration.test.ts tests/replication.test.ts tests/blocking.test.ts tests/eviction.test.ts tests/rdb.test.ts tests/streams.test.ts tests/scan.test.ts tests/slowlog.test.ts tests/bitmap.test.ts tests/hll.test.ts tests/geo.test.ts",
+    "test": "node --experimental-strip-types --test tests/resp.test.ts tests/storage.test.ts tests/strings_ttl.test.ts tests/skiplist.test.ts tests/polymorphic.test.ts tests/collections_ext.test.ts tests/aof.test.ts tests/transactions.test.ts tests/pubsub.test.ts tests/integration.test.ts tests/replication.test.ts tests/blocking.test.ts tests/eviction.test.ts tests/rdb.test.ts tests/streams.test.ts tests/scan.test.ts tests/slowlog.test.ts tests/bitmap.test.ts tests/hll.test.ts tests/geo.test.ts tests/bloom.test.ts",
     "bench": "node --experimental-strip-types benchmarks/bench.ts"
   },
   "keywords": [

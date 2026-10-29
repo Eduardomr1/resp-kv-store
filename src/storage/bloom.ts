@@ -47,7 +47,8 @@ export class BloomFilter {
     let newlySet = false;
 
     for (let i = 0; i < this.numHashes; i++) {
-      const bitIndex = Number((BigInt(h1) + BigInt(i) * BigInt(h2)) % BigInt(this.bitSize));
+      let bitIndex = Number((BigInt(h1) + BigInt(i) * BigInt(h2)) % BigInt(this.bitSize));
+      if (bitIndex < 0) bitIndex += this.bitSize;
       const bytePos = Math.floor(bitIndex / 8);
       const bitPos = bitIndex % 8;
       const mask = 1 << bitPos;
@@ -68,7 +69,8 @@ export class BloomFilter {
     const [h1, h2] = this.hashPair(item);
 
     for (let i = 0; i < this.numHashes; i++) {
-      const bitIndex = Number((BigInt(h1) + BigInt(i) * BigInt(h2)) % BigInt(this.bitSize));
+      let bitIndex = Number((BigInt(h1) + BigInt(i) * BigInt(h2)) % BigInt(this.bitSize));
+      if (bitIndex < 0) bitIndex += this.bitSize;
       const bytePos = Math.floor(bitIndex / 8);
       const bitPos = bitIndex % 8;
       const mask = 1 << bitPos;
@@ -90,22 +92,22 @@ export class BloomFilter {
   }
 
   private hashPair(str: string): [number, number] {
-    // 32-bit FNV-1a hash
+    // 32-bit unsigned FNV-1a hash
     let h1 = 0x811c9dc5;
     for (let i = 0; i < str.length; i++) {
       h1 ^= str.charCodeAt(i);
       h1 = Math.imul(h1, 0x01000193) >>> 0;
     }
 
-    // 32-bit Murmur-inspired second hash
+    // 32-bit unsigned second hash
     let h2 = 0x9747b28c;
     for (let i = str.length - 1; i >= 0; i--) {
       h2 ^= str.charCodeAt(i);
       h2 = Math.imul(h2, 0x5bd1e995) >>> 0;
-      h2 ^= h2 >>> 13;
+      h2 = (h2 ^ (h2 >>> 13)) >>> 0;
     }
     if (h2 === 0) h2 = 1;
 
-    return [h1, h2];
+    return [h1 >>> 0, h2 >>> 0];
   }
 }
