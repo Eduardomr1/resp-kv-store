@@ -15,6 +15,7 @@ import {
   type GeoUnit,
   type GeoCoordinates,
 } from './geo.ts';
+import { BloomFilter } from './bloom.ts';
 import {
   type StorageEntry,
   type StorageData,
@@ -2504,5 +2505,58 @@ export class StorageEngine {
     }
 
     return results;
+  }
+
+  public bfReserve(key: string, errorRate: number, capacity: number, expansion = 2): boolean {
+    let entry = this.store.get(key);
+    if (entry && !this.isExpired(key, entry)) {
+      throw new Error('ERR item exists');
+    }
+    const filter = new BloomFilter(capacity, errorRate, expansion);
+    this.store.set(key, {
+      data: { type: 'MBbloom--', value: filter },
+      expiresAt: null,
+      createdAt: Date.now(),
+      updatedAt: Date.now(),
+      lastAccessTime: Date.now(),
+      lfuCounter: LFU_INIT_VAL,
+      lfuDecayTime: Date.now(),
+    });
+    return true;
+  }
+
+  public bfAdd(key: string, item: string): boolean {
+    let entry = this.store.get(key);
+    if (!entry || this.isExpired(key, entry)) {
+      this.bfReserve(key, 0.01, 1000);
+      entry = this.store.get(key)!;
+    }
+    if (entry.data.type !== 'MBbloom--') {
+      throw new WrongTypeError();
+    }
+    const filter = entry.data.value as BloomFilter;
+    const added = filter.add(item);
+    entry.updatedAt = Date.now();
+    return added;
+  }
+
+  public bfExists(key: string, item: string): boolean {
+    const entry = this.store.get(key);
+    if (!entry || this.isExpired(key, entry)) return false;
+    if (entry.data.type !== 'MBbloom--') throw new WrongTypeError();
+    const filter = entry.data.value as BloomFilter;
+    return filter.exists(item);
+  }
+
+  public bfInfo(key: string): { capacity: number; size: number; numberOfItemsInserted: number } | null {
+    const entry = this.store.get(key);
+    if (!entry || this.isExpired(key, entry)) return null;
+    if (entry.data.type !== 'MBbloom--') throw new WrongTypeError();
+    const filter = entry.data.value as BloomFilter;
+    return {
+      capacity: filter.capacity,
+      size: filter.byteSize,
+      numberOfItemsInserted: filter.count,
+    };
   }
 }

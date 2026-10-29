@@ -2,7 +2,9 @@ import type { SkipList } from './skiplist.ts';
 import type { RedisStream } from './stream.ts';
 import type { EvictionPolicy } from '../eviction/types.ts';
 
-export type RedisDataType = 'string' | 'hash' | 'list' | 'set' | 'zset' | 'stream';
+import type { BloomFilter } from './bloom.ts';
+
+export type RedisDataType = 'string' | 'hash' | 'list' | 'set' | 'zset' | 'stream' | 'MBbloom--';
 
 export class WrongTypeError extends Error {
   constructor() {
@@ -42,13 +44,19 @@ export interface StreamData {
   value: RedisStream;
 }
 
+export interface BloomData {
+  type: 'MBbloom--';
+  value: BloomFilter;
+}
+
 export type StorageData =
   | StringData
   | HashData
   | ListData
   | SetData
   | ZSetData
-  | StreamData;
+  | StreamData
+  | BloomData;
 
 export interface StorageEntry {
   data: StorageData;
