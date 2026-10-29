@@ -180,6 +180,31 @@ Diseñado con estándares de **Systems & Backend Core Engineering**: seguridad b
   - `PFCOUNT key [key ...]`: Retorna la cardinalidad estimada. Para múltiples claves, realiza una unión en memoria sin alterar las claves fuente.
   - `PFMERGE destkey srckey [srckey ...]`: Fusiona los registros de múltiples fuentes en la clave destino computando el máximo por registro en $O(m)$.
 
+### 16. Indexación Geoespacial & Búsqueda por Radio (Geohash 52-bit)
+- Codificación entrelazada Morton de 52 bits sobre Sorted Sets (EPSG:3857) y cálculo de distancias ortodrómicas por fórmula de Haversine.
+- Filtrado por vecindarios de 9 cuadrantes geohash para búsquedas espaciales en $O(\log N + K)$.
+- Comandos soportados:
+  - `GEOADD key longitude latitude member [longitude latitude member ...]`: Inserta ubicaciones geoespaciales como miembros de un sorted set.
+  - `GEOPOS key member [member ...]`: Decodifica el hash de 52 bits y retorna las coordenadas geográficas `[lon, lat]`.
+  - `GEODIST key member1 member2 [m|km|ft|mi]`: Calcula la distancia geodésica exacta en la unidad especificada.
+  - `GEOSEARCH key FROMLONLAT lon lat BYRADIUS radius m|km|ft|mi`: Búsqueda de miembros dentro de un radio circular.
+
+### 17. Filtros de Bloom Probabilísticos (RedisBloom)
+- Estructura probabilística compacta para verificación de pertenencia a conjuntos con cero falsos negativos.
+- Doble función hash Kirsch-Mitzenmacher (FNV-1a + Murmur) sobre arrays de bits empaquetados.
+- Comandos soportados:
+  - `BF.RESERVE key error_rate capacity`: Inicializa un filtro con tasa de error y capacidad estimadas.
+  - `BF.ADD key item`: Agrega un elemento al filtro. Retorna 1 si es nuevo, 0 si ya estaba presente.
+  - `BF.MADD key item [item ...]`: Inserción por lotes.
+  - `BF.EXISTS key item`: Comprueba si el elemento posiblemente pertenece al filtro.
+  - `BF.MEXISTS key item [item ...]`: Comprobación por lotes.
+  - `BF.INFO key`: Retorna metadatos de capacidad, tamaño en bytes y recuento de inserciones.
+
+### 18. Diagnóstico de Memoria y Codificación
+- `MEMORY USAGE key`: Estimación de memoria en bytes consumida por una clave y su estructura interna.
+- `OBJECT ENCODING key`: Retorna el tipo de representación interna en memoria (`embstr`, `raw`, `hashtable`, `skiplist`, `quicklist`, `bloomfilter`).
+- `DBSIZE`: Retorna el número total de claves presentes en la base de datos.
+
 ---
 
 ## 🚀 Inicio Rápido
