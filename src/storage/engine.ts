@@ -2559,4 +2559,35 @@ export class StorageEngine {
       numberOfItemsInserted: filter.count,
     };
   }
+
+  public memoryUsage(key: string): number | null {
+    const entry = this.store.get(key);
+    if (!entry || this.isExpired(key, entry)) return null;
+    const keySize = Buffer.byteLength(key) + 64;
+    const dataSize = this.calculateDataMemory(entry.data);
+    return keySize + dataSize;
+  }
+
+  public objectEncoding(key: string): string | null {
+    const entry = this.store.get(key);
+    if (!entry || this.isExpired(key, entry)) return null;
+    switch (entry.data.type) {
+      case 'string':
+        return Buffer.isBuffer(entry.data.value) && entry.data.value.length < 44 ? 'embstr' : 'raw';
+      case 'hash':
+        return 'hashtable';
+      case 'list':
+        return 'quicklist';
+      case 'set':
+        return 'hashtable';
+      case 'zset':
+        return 'skiplist';
+      case 'stream':
+        return 'stream';
+      case 'MBbloom--':
+        return 'bloomfilter';
+      default:
+        return 'raw';
+    }
+  }
 }

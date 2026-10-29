@@ -1810,6 +1810,36 @@ export class TCPServer {
           return RESPSerializer.encodeInteger(this.engine.dbsize());
         }
 
+        case 'MEMORY': {
+          this.lastCommandMutated = false;
+          if (args.length < 3) {
+            return RESPSerializer.encodeError("wrong number of arguments for 'memory' command");
+          }
+          const subcmd = (args[1] as any).value.toString('utf8').toUpperCase();
+          if (subcmd === 'USAGE') {
+            const key = (args[2] as any).value.toString('utf8');
+            const usage = this.engine.memoryUsage(key);
+            if (usage === null) return RESP_CONSTANTS.NULL_BULK;
+            return RESPSerializer.encodeInteger(usage);
+          }
+          return RESPSerializer.encodeError(`unknown subcommand '${subcmd}' for 'MEMORY'`);
+        }
+
+        case 'OBJECT': {
+          this.lastCommandMutated = false;
+          if (args.length < 3) {
+            return RESPSerializer.encodeError("wrong number of arguments for 'object' command");
+          }
+          const subcmd = (args[1] as any).value.toString('utf8').toUpperCase();
+          if (subcmd === 'ENCODING') {
+            const key = (args[2] as any).value.toString('utf8');
+            const enc = this.engine.objectEncoding(key);
+            if (enc === null) return RESP_CONSTANTS.NULL_BULK;
+            return RESPSerializer.encodeBulkString(enc);
+          }
+          return RESPSerializer.encodeError(`unknown subcommand '${subcmd}' for 'OBJECT'`);
+        }
+
         case 'FLUSHALL':
         case 'FLUSHDB': {
           this.engine.flushall();
