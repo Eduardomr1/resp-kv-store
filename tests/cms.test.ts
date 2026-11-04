@@ -1,7 +1,10 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert';
+import net from 'node:net';
 import { CountMinSketch } from '../src/storage/cms.ts';
 import { StorageEngine } from '../src/storage/engine.ts';
+import { TCPServer } from '../src/server.ts';
+import { RESPParser } from '../src/resp/parser.ts';
 
 describe('CountMinSketch Unit Tests', () => {
   it('validates constructor parameters', () => {
@@ -203,5 +206,123 @@ describe('StorageEngine CMS Lifecycle Suite', () => {
     engine.cmsMerge('dest', ['s1', 's2'], [1, 3]);
     // 10*1 + 20*3 = 70
     assert.deepStrictEqual(engine.cmsQuery('dest', ['view']), [70]);
+  });
+});
+
+describe('Server TCP Count-Min Sketch Suite', () => {
+  it('executes CMS commands over live RESP TCP socket', async () => {
+    const port = 16422;
+    const server = new TCPServer({ port });
+    await server.start();
+
+    const client = net.createConnection({ port, host: '127.0.0.1' });
+    const parser = new RESPParser();
+    const responses: any[] = [];
+
+    client.on('data', (chunk) => {
+      parser.feed(chunk);
+      const items = parser.parse();
+      for (const item of items) {
+        responses.push(item);
+      }
+    });
+
+    const send = (cmds: string[]) => {
+      let payload = `*${cmds.length}\r\n`;
+      for (const c of cmds) {
+        payload += `$${Buffer.byteLength(c)}\r\n${c}\r\n`;
+      }
+      client.write(payload);
+    };
+
+    const waitForResponse = async (targetCount: number): Promise<void> => {
+      while (responses.length < targetCount) {
+        await new Promise((r) => setTimeout(r, 10));
+      }
+    };
+
+    try {
+      // 1. CMS.INITBYDIM
+      send(['CMS.INITBYDIM', 'tcp_cms', '1000', '5']);
+      await waitForResponse(1);
+      assert.strictEqual(responses[0].type, 'simple_string');
+      assert.strictEqual(responses[0].value, 'OK');
+
+      // 2. Duplicate init error
+      send(['CMS.INITBYDIM', 'tcp_cms', '1000', '5']);
+      await waitForResponse(2);
+      assert.strictEqual(responses[1].type, 'error');
+
+      // 3. CMS.INITBYPROB
+      send(['CMS.INITBYPROB', 'prob_cms', '0.01', '0.99']);
+      await waitForResponse(3);
+      assert.strictEqual(responses[2].type, 'simple_string');
+      assert.strictEqual(responses[2].value, 'OK');
+
+      // 4. CMS.INCRBY multiple items
+      send(['CMS.INCRBY', 'tcp_cms', 'page:home', '10', 'page:docs', '5']);
+      await waitForResponse(4);
+      assert.strictEqual(responses[3].type, 'array');
+      assert.deepStrictEqual(
+        responses[3].value.map((v: any) => v.value),
+        [10, 5]
+      );
+
+      // 5. CMS.INCRBY single item
+      send(['CMS.INCRBY', 'tcp_cms', 'page:home', '15']);
+      await waitForResponse(5);
+      assert.strictEqual(responses[4].type, 'array');
+      assert.deepStrictEqual(
+        responses[4].value.map((v: any) => v.value),
+        [25]
+      );
+
+      // 6. CMS.QUERY
+      send(['CMS.QUERY', 'tcp_cms', 'page:home', 'page:docs', 'page:about']);
+      await waitForResponse(6);
+      assert.strictEqual(responses[5].type, 'array');
+      assert.deepStrictEqual(
+        responses[5].value.map((v: any) => v.value),
+        [25, 5, 0]
+      );
+
+      // 7. CMS.INFO
+      send(['CMS.INFO', 'tcp_cms']);
+      await waitForResponse(7);
+      assert.strictEqual(responses[6].type, 'array');
+      const infoVals = responses[6].value.map((v: any) =>
+        Buffer.isBuffer(v.value) ? v.value.toString('utf8') : v.value
+      );
+      assert.strictEqual(infoVals[0], 'width');
+      assert.strictEqual(infoVals[1], 1000);
+      assert.strictEqual(infoVals[2], 'depth');
+      assert.strictEqual(infoVals[3], 5);
+      assert.strictEqual(infoVals[4], 'count');
+      assert.strictEqual(infoVals[5], 30);
+
+      // 8. Merge test
+      send(['CMS.INITBYDIM', 'tcp_src', '1000', '5']);
+      await waitForResponse(8);
+      assert.strictEqual(responses[7].value, 'OK');
+
+      send(['CMS.INCRBY', 'tcp_src', 'page:docs', '10']);
+      await waitForResponse(9);
+
+      send(['CMS.MERGE', 'tcp_cms', '1', 'tcp_src', 'WEIGHTS', '2']);
+      await waitForResponse(10);
+      assert.strictEqual(responses[9].type, 'simple_string');
+      assert.strictEqual(responses[9].value, 'OK');
+
+      send(['CMS.QUERY', 'tcp_cms', 'page:docs']);
+      await waitForResponse(11);
+      assert.strictEqual(responses[10].type, 'array');
+      assert.deepStrictEqual(
+        responses[10].value.map((v: any) => v.value),
+        [25] // 5 + 10 * 2 = 25
+      );
+    } finally {
+      client.destroy();
+      await server.stop();
+    }
   });
 });
