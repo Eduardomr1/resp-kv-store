@@ -117,6 +117,18 @@ export class CountMinSketch {
   }
 
   /**
+   * Increments multiple items by their respective counts in a single batch.
+   * Returns an array of updated estimated counts corresponding to each item.
+   */
+  public incrByMultiple(pairs: Array<{ item: string; increment: number }>): number[] {
+    const results: number[] = [];
+    for (const { item, increment } of pairs) {
+      results.push(this.incrBy(item, increment));
+    }
+    return results;
+  }
+
+  /**
    * Queries the estimated frequency count for a single item.
    */
   public query(item: string): number {
@@ -132,6 +144,21 @@ export class CountMinSketch {
     }
 
     return minVal;
+  }
+
+  /**
+   * Queries estimated frequencies for multiple items in a batch.
+   */
+  public queryMultiple(items: string[]): number[] {
+    return items.map((item) => this.query(item));
+  }
+
+  /**
+   * Resets the entire sketch counters to zero and clears total count.
+   */
+  public reset(): void {
+    this.table.fill(0);
+    this.totalCount = 0;
   }
 
   /**

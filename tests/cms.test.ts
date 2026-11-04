@@ -131,4 +131,23 @@ describe('CountMinSketch Unit Tests', () => {
       /ERR sketches must have identical width and depth to merge/
     );
   });
+
+  it('supports batch increments, batch queries and state reset', () => {
+    const cms = new CountMinSketch(1000, 5);
+
+    const incResults = cms.incrByMultiple([
+      { item: 'apple', increment: 10 },
+      { item: 'banana', increment: 25 },
+      { item: 'cherry', increment: 5 },
+    ]);
+    assert.deepStrictEqual(incResults, [10, 25, 5]);
+
+    const queryResults = cms.queryMultiple(['banana', 'cherry', 'orange', 'apple']);
+    assert.deepStrictEqual(queryResults, [25, 5, 0, 10]);
+    assert.strictEqual(cms.info.count, 40);
+
+    cms.reset();
+    assert.strictEqual(cms.info.count, 0);
+    assert.deepStrictEqual(cms.queryMultiple(['apple', 'banana', 'cherry']), [0, 0, 0]);
+  });
 });
