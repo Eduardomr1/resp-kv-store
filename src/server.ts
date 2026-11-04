@@ -202,7 +202,8 @@ export class TCPServer {
     'SADD', 'SREM', 'SPOP', 'SMOVE', 'SUNIONSTORE', 'SINTERSTORE', 'SDIFFSTORE',
     'ZADD', 'ZINCRBY', 'ZREM', 'ZPOPMIN', 'ZPOPMAX', 'ZMPOP',
     'EXPIRE', 'PEXPIRE', 'EXPIREAT', 'PEXPIREAT', 'PERSIST',
-    'FLUSHALL', 'FLUSHDB', 'XADD', 'SETBIT', 'BITOP', 'PFADD', 'PFMERGE'
+    'FLUSHALL', 'FLUSHDB', 'XADD', 'SETBIT', 'BITOP', 'PFADD', 'PFMERGE',
+    'BF.RESERVE', 'BF.ADD', 'BF.MADD', 'CMS.INITBYDIM', 'CMS.INITBYPROB', 'CMS.INCRBY', 'CMS.MERGE'
   ]);
 
   private static parseStrictInt(raw: string): number | null {
@@ -1719,6 +1720,159 @@ export class TCPServer {
             'Number of items inserted',
             info.numberOfItemsInserted,
           ]);
+        }
+
+        // =======================
+        // COUNT-MIN SKETCH (CMS)
+        // =======================
+        case 'CMS.INITBYDIM': {
+          if (args.length !== 4) {
+            this.lastCommandMutated = false;
+            return RESPSerializer.encodeError("wrong number of arguments for 'cms.initbydim' command");
+          }
+          const key = (args[1] as any).value.toString('utf8');
+          const width = Number((args[2] as any).value.toString('utf8'));
+          const depth = Number((args[3] as any).value.toString('utf8'));
+          if (!Number.isInteger(width) || width <= 0 || !Number.isInteger(depth) || depth <= 0) {
+            this.lastCommandMutated = false;
+            return RESPSerializer.encodeError('ERR width and depth must be positive integers');
+          }
+          try {
+            this.engine.cmsInitByDim(key, width, depth);
+            return RESP_CONSTANTS.OK;
+          } catch (err: any) {
+            this.lastCommandMutated = false;
+            return RESPSerializer.encodeError(err.message);
+          }
+        }
+
+        case 'CMS.INITBYPROB': {
+          if (args.length !== 4) {
+            this.lastCommandMutated = false;
+            return RESPSerializer.encodeError("wrong number of arguments for 'cms.initbyprob' command");
+          }
+          const key = (args[1] as any).value.toString('utf8');
+          const errorRate = Number((args[2] as any).value.toString('utf8'));
+          const probability = Number((args[3] as any).value.toString('utf8'));
+          if (isNaN(errorRate) || isNaN(probability) || errorRate <= 0 || errorRate >= 1 || probability <= 0 || probability >= 1) {
+            this.lastCommandMutated = false;
+            return RESPSerializer.encodeError('ERR error rate and probability must be between 0 and 1');
+          }
+          try {
+            this.engine.cmsInitByProb(key, errorRate, probability);
+            return RESP_CONSTANTS.OK;
+          } catch (err: any) {
+            this.lastCommandMutated = false;
+            return RESPSerializer.encodeError(err.message);
+          }
+        }
+
+        case 'CMS.INCRBY': {
+          if (args.length < 4 || (args.length - 2) % 2 !== 0) {
+            this.lastCommandMutated = false;
+            return RESPSerializer.encodeError("wrong number of arguments for 'cms.incrby' command");
+          }
+          const key = (args[1] as any).value.toString('utf8');
+          const pairs: Array<{ item: string; increment: number }> = [];
+          for (let i = 2; i < args.length; i += 2) {
+            const item = (args[i] as any).value.toString('utf8');
+            const inc = Number((args[i + 1] as any).value.toString('utf8'));
+            if (!Number.isInteger(inc) || inc < 0) {
+              this.lastCommandMutated = false;
+              return RESPSerializer.encodeError('ERR increment must be a non-negative integer');
+            }
+            pairs.push({ item, increment: inc });
+          }
+          try {
+            const results = this.engine.cmsIncrBy(key, pairs);
+            return RESPSerializer.encodeArray(results);
+          } catch (err: any) {
+            this.lastCommandMutated = false;
+            return RESPSerializer.encodeError(err.message);
+          }
+        }
+
+        case 'CMS.QUERY': {
+          if (args.length < 3) {
+            this.lastCommandMutated = false;
+            return RESPSerializer.encodeError("wrong number of arguments for 'cms.query' command");
+          }
+          this.lastCommandMutated = false;
+          const key = (args[1] as any).value.toString('utf8');
+          const items = args.slice(2).map((a: any) => a.value.toString('utf8'));
+          try {
+            const results = this.engine.cmsQuery(key, items);
+            return RESPSerializer.encodeArray(results);
+          } catch (err: any) {
+            return RESPSerializer.encodeError(err.message);
+          }
+        }
+
+        case 'CMS.INFO': {
+          if (args.length !== 2) {
+            this.lastCommandMutated = false;
+            return RESPSerializer.encodeError("wrong number of arguments for 'cms.info' command");
+          }
+          this.lastCommandMutated = false;
+          const key = (args[1] as any).value.toString('utf8');
+          const info = this.engine.cmsInfo(key);
+          if (!info) return RESPSerializer.encodeError('ERR not found');
+          return RESPSerializer.encodeArray([
+            'width',
+            info.width,
+            'depth',
+            info.depth,
+            'count',
+            info.count,
+          ]);
+        }
+
+        case 'CMS.MERGE': {
+          if (args.length < 4) {
+            this.lastCommandMutated = false;
+            return RESPSerializer.encodeError("wrong number of arguments for 'cms.merge' command");
+          }
+          const destKey = (args[1] as any).value.toString('utf8');
+          const numKeys = Number((args[2] as any).value.toString('utf8'));
+          if (!Number.isInteger(numKeys) || numKeys <= 0) {
+            this.lastCommandMutated = false;
+            return RESPSerializer.encodeError('ERR numKeys must be a positive integer');
+          }
+          if (args.length < 3 + numKeys) {
+            this.lastCommandMutated = false;
+            return RESPSerializer.encodeError("wrong number of arguments for 'cms.merge' command");
+          }
+          const srcKeys: string[] = [];
+          for (let i = 0; i < numKeys; i++) {
+            srcKeys.push((args[3 + i] as any).value.toString('utf8'));
+          }
+
+          let weights: number[] | undefined;
+          let idx = 3 + numKeys;
+          if (idx < args.length) {
+            const opt = (args[idx] as any).value.toString('utf8').toUpperCase();
+            if (opt !== 'WEIGHTS' || args.length !== idx + 1 + numKeys) {
+              this.lastCommandMutated = false;
+              return RESPSerializer.encodeError('ERR syntax error in CMS.MERGE');
+            }
+            weights = [];
+            for (let i = 0; i < numKeys; i++) {
+              const w = Number((args[idx + 1 + i] as any).value.toString('utf8'));
+              if (!Number.isInteger(w) || w <= 0) {
+                this.lastCommandMutated = false;
+                return RESPSerializer.encodeError('ERR weight must be a positive integer');
+              }
+              weights.push(w);
+            }
+          }
+
+          try {
+            this.engine.cmsMerge(destKey, srcKeys, weights);
+            return RESP_CONSTANTS.OK;
+          } catch (err: any) {
+            this.lastCommandMutated = false;
+            return RESPSerializer.encodeError(err.message);
+          }
         }
 
         // =======================
