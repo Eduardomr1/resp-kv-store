@@ -3,8 +3,9 @@ import type { RedisStream } from './stream.ts';
 import type { EvictionPolicy } from '../eviction/types.ts';
 
 import type { BloomFilter } from './bloom.ts';
+import type { CountMinSketch } from './cms.ts';
 
-export type RedisDataType = 'string' | 'hash' | 'list' | 'set' | 'zset' | 'stream' | 'MBbloom--';
+export type RedisDataType = 'string' | 'hash' | 'list' | 'set' | 'zset' | 'stream' | 'MBbloom--' | 'CMSketch-';
 
 export class WrongTypeError extends Error {
   constructor() {
@@ -49,6 +50,11 @@ export interface BloomData {
   value: BloomFilter;
 }
 
+export interface CMSData {
+  type: 'CMSketch-';
+  value: CountMinSketch;
+}
+
 export type StorageData =
   | StringData
   | HashData
@@ -56,7 +62,8 @@ export type StorageData =
   | SetData
   | ZSetData
   | StreamData
-  | BloomData;
+  | BloomData
+  | CMSData;
 
 export interface StorageEntry {
   data: StorageData;

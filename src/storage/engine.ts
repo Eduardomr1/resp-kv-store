@@ -16,6 +16,7 @@ import {
   type GeoCoordinates,
 } from './geo.ts';
 import { BloomFilter } from './bloom.ts';
+import { CountMinSketch, type CMSInfo } from './cms.ts';
 import {
   type StorageEntry,
   type StorageData,
@@ -2363,6 +2364,10 @@ export class StorageEngine {
         }
         return size;
       }
+      case 'MBbloom--':
+        return (data.value as BloomFilter).byteSize;
+      case 'CMSketch-':
+        return (data.value as CountMinSketch).byteSize;
       default:
         return 0;
     }
@@ -2586,8 +2591,111 @@ export class StorageEngine {
         return 'stream';
       case 'MBbloom--':
         return 'bloomfilter';
+      case 'CMSketch-':
+        return 'count-min-sketch';
       default:
         return 'raw';
     }
+  }
+
+  public cmsInitByDim(key: string, width: number, depth: number): boolean {
+    let entry = this.store.get(key);
+    if (entry && !this.isExpired(key, entry)) {
+      throw new Error('ERR item exists');
+    }
+    const sketch = new CountMinSketch(width, depth);
+    this.store.set(key, {
+      data: { type: 'CMSketch-', value: sketch },
+      expiresAt: null,
+      createdAt: Date.now(),
+      updatedAt: Date.now(),
+      lastAccessTime: Date.now(),
+      lfuCounter: LFU_INIT_VAL,
+      lfuDecayTime: Date.now(),
+    });
+    return true;
+  }
+
+  public cmsInitByProb(key: string, errorRate: number, probability: number): boolean {
+    let entry = this.store.get(key);
+    if (entry && !this.isExpired(key, entry)) {
+      throw new Error('ERR item exists');
+    }
+    const sketch = CountMinSketch.createByProb(errorRate, probability);
+    this.store.set(key, {
+      data: { type: 'CMSketch-', value: sketch },
+      expiresAt: null,
+      createdAt: Date.now(),
+      updatedAt: Date.now(),
+      lastAccessTime: Date.now(),
+      lfuCounter: LFU_INIT_VAL,
+      lfuDecayTime: Date.now(),
+    });
+    return true;
+  }
+
+  public cmsIncrBy(key: string, items: Array<{ item: string; increment: number }>): number[] {
+    let entry = this.store.get(key);
+    if (!entry || this.isExpired(key, entry)) {
+      throw new Error('ERR key does not exist');
+    }
+    if (entry.data.type !== 'CMSketch-') {
+      throw new WrongTypeError();
+    }
+    const sketch = entry.data.value as CountMinSketch;
+    const results = sketch.incrByMultiple(items);
+    entry.updatedAt = Date.now();
+    return results;
+  }
+
+  public cmsQuery(key: string, items: string[]): number[] {
+    const entry = this.store.get(key);
+    if (!entry || this.isExpired(key, entry)) {
+      throw new Error('ERR key does not exist');
+    }
+    if (entry.data.type !== 'CMSketch-') {
+      throw new WrongTypeError();
+    }
+    const sketch = entry.data.value as CountMinSketch;
+    return sketch.queryMultiple(items);
+  }
+
+  public cmsInfo(key: string): CMSInfo | null {
+    const entry = this.store.get(key);
+    if (!entry || this.isExpired(key, entry)) return null;
+    if (entry.data.type !== 'CMSketch-') throw new WrongTypeError();
+    const sketch = entry.data.value as CountMinSketch;
+    return sketch.info;
+  }
+
+  public cmsMerge(destKey: string, srcKeys: string[], weights?: number[]): boolean {
+    let destEntry = this.store.get(destKey);
+    if (!destEntry || this.isExpired(destKey, destEntry)) {
+      throw new Error('ERR dest key does not exist');
+    }
+    if (destEntry.data.type !== 'CMSketch-') {
+      throw new WrongTypeError();
+    }
+    const destSketch = destEntry.data.value as CountMinSketch;
+
+    const sources: Array<{ sketch: CountMinSketch; weight: number }> = [];
+    for (let i = 0; i < srcKeys.length; i++) {
+      const srcKey = srcKeys[i]!;
+      const srcEntry = this.store.get(srcKey);
+      if (!srcEntry || this.isExpired(srcKey, srcEntry)) {
+        throw new Error('ERR source key does not exist');
+      }
+      if (srcEntry.data.type !== 'CMSketch-') {
+        throw new WrongTypeError();
+      }
+      const weight = weights && weights[i] !== undefined ? weights[i]! : 1;
+      sources.push({ sketch: srcEntry.data.value as CountMinSketch, weight });
+    }
+
+    for (const { sketch, weight } of sources) {
+      destSketch.merge(sketch, weight);
+    }
+    destEntry.updatedAt = Date.now();
+    return true;
   }
 }

@@ -1,6 +1,7 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert';
 import { CountMinSketch } from '../src/storage/cms.ts';
+import { StorageEngine } from '../src/storage/engine.ts';
 
 describe('CountMinSketch Unit Tests', () => {
   it('validates constructor parameters', () => {
@@ -149,5 +150,58 @@ describe('CountMinSketch Unit Tests', () => {
     cms.reset();
     assert.strictEqual(cms.info.count, 0);
     assert.deepStrictEqual(cms.queryMultiple(['apple', 'banana', 'cherry']), [0, 0, 0]);
+  });
+});
+
+describe('StorageEngine CMS Lifecycle Suite', () => {
+  it('manages CMS keys lifecycle: init, incrby, query, info and encoding', () => {
+    const engine = new StorageEngine();
+
+    assert.strictEqual(engine.cmsInfo('missing_cms'), null);
+
+    // Init by dimension
+    assert.strictEqual(engine.cmsInitByDim('sketch:dim', 1000, 5), true);
+    assert.throws(() => engine.cmsInitByDim('sketch:dim', 500, 3), /ERR item exists/);
+
+    assert.strictEqual(engine.objectEncoding('sketch:dim'), 'count-min-sketch');
+
+    // Init by prob
+    assert.strictEqual(engine.cmsInitByProb('sketch:prob', 0.005, 0.95), true);
+
+    // Incrby
+    const res = engine.cmsIncrBy('sketch:dim', [
+      { item: 'metrics:cpu', increment: 42 },
+      { item: 'metrics:memory', increment: 17 },
+    ]);
+    assert.deepStrictEqual(res, [42, 17]);
+
+    // Query
+    const queried = engine.cmsQuery('sketch:dim', ['metrics:cpu', 'metrics:disk', 'metrics:memory']);
+    assert.deepStrictEqual(queried, [42, 0, 17]);
+
+    // Info
+    const info = engine.cmsInfo('sketch:dim');
+    assert.ok(info);
+    assert.strictEqual(info.width, 1000);
+    assert.strictEqual(info.depth, 5);
+    assert.strictEqual(info.count, 59);
+
+    // Type checking
+    engine.set('str_key', 'plain string');
+    assert.throws(() => engine.cmsQuery('str_key', ['foo']), /WRONGTYPE/);
+  });
+
+  it('merges multiple CMS keys in engine', () => {
+    const engine = new StorageEngine();
+    engine.cmsInitByDim('s1', 500, 4);
+    engine.cmsInitByDim('s2', 500, 4);
+    engine.cmsInitByDim('dest', 500, 4);
+
+    engine.cmsIncrBy('s1', [{ item: 'view', increment: 10 }]);
+    engine.cmsIncrBy('s2', [{ item: 'view', increment: 20 }]);
+
+    engine.cmsMerge('dest', ['s1', 's2'], [1, 3]);
+    // 10*1 + 20*3 = 70
+    assert.deepStrictEqual(engine.cmsQuery('dest', ['view']), [70]);
   });
 });
