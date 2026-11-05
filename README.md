@@ -200,9 +200,23 @@ Diseñado con estándares de **Systems & Backend Core Engineering**: seguridad b
   - `BF.MEXISTS key item [item ...]`: Comprobación por lotes.
   - `BF.INFO key`: Retorna metadatos de capacidad, tamaño en bytes y recuento de inserciones.
 
-### 18. Diagnóstico de Memoria y Codificación
+### 18. Count-Min Sketch (CMS): Estimación de Frecuencia Probabilística Sublineal (RedisBloom)
+- Estructura probabilística sublineal para conteo de frecuencias de eventos en flujos masivos de streaming (heavy hitters y top-K).
+- Matriz bidimensional de contadores en `Uint32Array` de dimensiones $w \times d$ indexada por doble hash Kirsch-Mitzenmacher:
+  - $w = \lceil 2 / \epsilon \rceil$ (ancho por fila para cota de sobrestimación $\epsilon \cdot N$).
+  - $d = \lceil \ln(1 / \delta) / \ln(2) \rceil$ (profundidad de filas para probabilidad de confianza $1 - \delta$).
+- Garantía matemática formal: nunca subestima la frecuencia real ($\hat{a}_i \ge a_i$) y el error de sobrestimación está acotado por $\hat{a}_i \le a_i + \epsilon \cdot N$ con probabilidad $\ge 1 - \delta$.
+- Comandos soportados:
+  - `CMS.INITBYDIM key width depth`: Inicializa un Count-Min Sketch con dimensiones explícitas de ancho y profundidad.
+  - `CMS.INITBYPROB key error probability`: Inicializa el sketch derivando automáticamente $w$ y $d$ a partir del error admisible y nivel de certeza.
+  - `CMS.INCRBY key item increment [item increment ...]`: Incrementa contadores de uno o varios elementos en lote y devuelve el valor mínimo actualizado.
+  - `CMS.QUERY key item [item ...]`: Consulta la estimación de frecuencia de múltiples elementos en tiempo constante $O(d)$.
+  - `CMS.INFO key`: Retorna metadatos de ancho, profundidad y total de eventos registrados.
+  - `CMS.MERGE destKey numKeys srcKey [srcKey ...] [WEIGHTS weight [weight ...]]`: Fusiona sketches homogéneos con ponderaciones multiplicativas enteras.
+
+### 19. Diagnóstico de Memoria y Codificación
 - `MEMORY USAGE key`: Estimación de memoria en bytes consumida por una clave y su estructura interna.
-- `OBJECT ENCODING key`: Retorna el tipo de representación interna en memoria (`embstr`, `raw`, `hashtable`, `skiplist`, `quicklist`, `bloomfilter`).
+- `OBJECT ENCODING key`: Retorna el tipo de representación interna en memoria (`embstr`, `raw`, `hashtable`, `skiplist`, `quicklist`, `bloomfilter`, `count-min-sketch`).
 - `DBSIZE`: Retorna el número total de claves presentes en la base de datos.
 
 ---
@@ -269,6 +283,14 @@ redis-cli -p 6379 PFADD unique_visitors "192.168.1.1" "192.168.1.2" "192.168.1.1
 # Salida: (integer) 1
 redis-cli -p 6379 PFCOUNT unique_visitors
 # Salida: (integer) 2
+
+# Count-Min Sketch (CMS)
+redis-cli -p 6379 CMS.INITBYPROB page_views 0.001 0.99
+# Salida: OK
+redis-cli -p 6379 CMS.INCRBY page_views "/docs" 42 "/blog" 15
+# Salida: 1) (integer) 42  2) (integer) 15
+redis-cli -p 6379 CMS.QUERY page_views "/docs" "/blog" "/missing"
+# Salida: 1) (integer) 42  2) (integer) 15  3) (integer) 0
 
 redis-cli -p 6379 SAVE
 redis-cli -p 6379 INFO
@@ -358,7 +380,10 @@ resp-kv-store/
 │   ├── storage/                 # Engine en memoria, SkipList, persistencia AOF y RDB
 │   │   ├── aof.ts
 │   │   ├── bitmap.ts            # Manipulación de bits, popcount y operaciones booleanas
+│   │   ├── bloom.ts             # Filtro de Bloom probabilístico (Kirsch-Mitzenmacher)
+│   │   ├── cms.ts               # Count-Min Sketch probabilístico sublineal
 │   │   ├── engine.ts            # Motor de almacenamiento polimórfico y TTL
+│   │   ├── geo.ts               # Indexación geoespacial con codificación Geohash 52-bit
 │   │   ├── hll.ts               # HyperLogLog de 16,384 registros y media armónica
 │   │   ├── rdb.ts
 │   │   ├── rdb_types.ts
@@ -370,7 +395,7 @@ resp-kv-store/
 │   └── transactions/            # Engine de transacciones MULTI/EXEC y bloqueo optimista WATCH
 │       ├── manager.ts
 │       └── types.ts
-├── tests/                       # 17 suites de pruebas unitarias y de integración (127 tests)
+├── tests/                       # 19 suites de pruebas unitarias y de integración (156 tests)
 ├── package.json
 └── tsconfig.json
 ```
