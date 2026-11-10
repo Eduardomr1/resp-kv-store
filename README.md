@@ -214,9 +214,26 @@ Diseñado con estándares de **Systems & Backend Core Engineering**: seguridad b
   - `CMS.INFO key`: Retorna metadatos de ancho, profundidad y total de eventos registrados.
   - `CMS.MERGE destKey numKeys srcKey [srcKey ...] [WEIGHTS weight [weight ...]]`: Fusiona sketches homogéneos con ponderaciones multiplicativas enteras.
 
-### 19. Diagnóstico de Memoria y Codificación
+### 19. Filtro de Cuckoo Probabilístico con Soporte de Eliminación Dinámica (RedisBloom)
+- Estructura probabilística basada en **Cuckoo Hashing** que supera a los Filtros de Bloom al permitir la **eliminación dinámica** de elementos sin reconstruir la estructura y manteniendo una tasa predecible de falsos positivos.
+- **Hashing de Desplazamiento Parcial**:
+  - Emplea huellas binarias compactas (*fingerprints*) y resolución de doble bucket mediante la propiedad involutiva:
+    $$i_2 = (i_1 \oplus \text{hash}(fp)) \pmod m$$
+  - Almacena $b=4$ entradas por bucket con desplazamiento en cascada (*kickout eviction chain*) con cota máxima de saltos (500) para garantizar operaciones amortizadas en $O(1)$.
+- Comandos soportados:
+  - `CF.RESERVE key capacity [BUCKETSIZE size] [MAXITERATIONS max] [EXPANSION exp]`: Inicializa un Cuckoo Filter reservando la potencia de 2 óptima de buckets para minimizar colisiones.
+  - `CF.ADD key item`: Inserta un elemento en el filtro, desplazando recursivamente entradas existentes si ambos buckets candidatos están saturados.
+  - `CF.ADDNX key item`: Inserción condicional únicamente si el elemento no existe previamente en la estructura.
+  - `CF.INSERT key [CAPACITY cap] [NOCREATE] ITEMS item [item ...]`: Inserción de múltiples elementos por lotes con inicialización dinámica opcional.
+  - `CF.EXISTS key item`: Verifica la posible membresía de un elemento examinando los dos buckets candidatos.
+  - `CF.MEXISTS key item [item ...]`: Comprobación de membresía en lote.
+  - `CF.DEL key item`: Elimina una instancia de la huella del elemento en tiempo $O(1)$. Retorna 1 si se eliminó o 0 si no se encontró.
+  - `CF.COUNT key item`: Retorna el número de ocurrencias almacenadas de la huella del elemento.
+  - `CF.INFO key`: Retorna metadatos de capacidad, tamaño en bytes, número de buckets, filtros y recuento de inserciones y eliminaciones.
+
+### 20. Diagnóstico de Memoria y Codificación
 - `MEMORY USAGE key`: Estimación de memoria en bytes consumida por una clave y su estructura interna.
-- `OBJECT ENCODING key`: Retorna el tipo de representación interna en memoria (`embstr`, `raw`, `hashtable`, `skiplist`, `quicklist`, `bloomfilter`, `count-min-sketch`).
+- `OBJECT ENCODING key`: Retorna el tipo de representación interna en memoria (`embstr`, `raw`, `hashtable`, `skiplist`, `quicklist`, `bloomfilter`, `count-min-sketch`, `cuckoofilter`).
 - `DBSIZE`: Retorna el número total de claves presentes en la base de datos.
 
 ---
@@ -292,6 +309,18 @@ redis-cli -p 6379 CMS.INCRBY page_views "/docs" 42 "/blog" 15
 redis-cli -p 6379 CMS.QUERY page_views "/docs" "/blog" "/missing"
 # Salida: 1) (integer) 42  2) (integer) 15  3) (integer) 0
 
+# Cuckoo Filter
+redis-cli -p 6379 CF.RESERVE blacklist 10000
+# Salida: OK
+redis-cli -p 6379 CF.ADD blacklist "bad_ip_192.168.1.1"
+# Salida: (integer) 1
+redis-cli -p 6379 CF.EXISTS blacklist "bad_ip_192.168.1.1"
+# Salida: (integer) 1
+redis-cli -p 6379 CF.DEL blacklist "bad_ip_192.168.1.1"
+# Salida: (integer) 1
+redis-cli -p 6379 CF.EXISTS blacklist "bad_ip_192.168.1.1"
+# Salida: (integer) 0
+
 redis-cli -p 6379 SAVE
 redis-cli -p 6379 INFO
 ```
@@ -300,7 +329,7 @@ redis-cli -p 6379 INFO
 
 ## 🧪 Pruebas Unitarias y de Integración
 
-El proyecto incluye 17 suites de pruebas con **127 pruebas automatizadas** que cubren todas las ramas del sistema:
+El proyecto incluye 22 suites de pruebas con **162 pruebas automatizadas** que cubren todas las ramas del sistema:
 
 ```bash
 npm test
@@ -324,8 +353,12 @@ npm test
 15. `tests/integration.test.ts`: Ciclo de vida completo end-to-end sobre sockets TCP reales.
 16. `tests/bitmap.test.ts`: Direccionamiento de bits Big-Endian, popcount 8-bit, bitpos y operaciones booleanas (`AND`, `OR`, `XOR`, `NOT`).
 17. `tests/hll.test.ts`: Estimación probabilística HLL, linear counting, convergencia de error $< 2\%$, unión y fusión de registros.
+18. `tests/bloom.test.ts`: Filtros de Bloom probabilísticos, inserciones masivas MADD y verificación de falso positivo.
+19. `tests/cms.test.ts`: Count-Min Sketch, convergencia de frecuencias, merges ponderados y telemetría.
+20. `tests/geo.test.ts`: Indexación geoespacial, geohashes de 52 bits y búsqueda por radio geodésico Haversine.
+21. `tests/cuckoo.test.ts`: Cuckoo Filter con hashing de desplazamiento parcial, eliminación dinámica y comandos RESP en vivo.
 
-**Resultado de ejecución**: `127 pass, 0 fail (100% éxito en ~2.4s)`.
+**Resultado de ejecución**: `162 pass, 0 fail (100% éxito)`.
 
 ---
 
@@ -382,6 +415,7 @@ resp-kv-store/
 │   │   ├── bitmap.ts            # Manipulación de bits, popcount y operaciones booleanas
 │   │   ├── bloom.ts             # Filtro de Bloom probabilístico (Kirsch-Mitzenmacher)
 │   │   ├── cms.ts               # Count-Min Sketch probabilístico sublineal
+│   │   ├── cuckoo.ts            # Filtro de Cuckoo probabilístico con eliminación dinámica y kickouts
 │   │   ├── engine.ts            # Motor de almacenamiento polimórfico y TTL
 │   │   ├── geo.ts               # Indexación geoespacial con codificación Geohash 52-bit
 │   │   ├── hll.ts               # HyperLogLog de 16,384 registros y media armónica
@@ -395,7 +429,7 @@ resp-kv-store/
 │   └── transactions/            # Engine de transacciones MULTI/EXEC y bloqueo optimista WATCH
 │       ├── manager.ts
 │       └── types.ts
-├── tests/                       # 19 suites de pruebas unitarias y de integración (156 tests)
+├── tests/                       # 22 suites de pruebas unitarias y de integración (162 tests)
 ├── package.json
 └── tsconfig.json
 ```
