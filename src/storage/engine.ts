@@ -17,6 +17,7 @@ import {
 } from './geo.ts';
 import { BloomFilter } from './bloom.ts';
 import { CountMinSketch, type CMSInfo } from './cms.ts';
+import { CuckooFilter, type CuckooInfo } from './cuckoo.ts';
 import {
   type StorageEntry,
   type StorageData,
@@ -2368,6 +2369,8 @@ export class StorageEngine {
         return (data.value as BloomFilter).byteSize;
       case 'CMSketch-':
         return (data.value as CountMinSketch).byteSize;
+      case 'Cuckoo---':
+        return (data.value as CuckooFilter).byteSize;
       default:
         return 0;
     }
@@ -2593,6 +2596,8 @@ export class StorageEngine {
         return 'bloomfilter';
       case 'CMSketch-':
         return 'count-min-sketch';
+      case 'Cuckoo---':
+        return 'cuckoofilter';
       default:
         return 'raw';
     }
@@ -2697,5 +2702,159 @@ export class StorageEngine {
     }
     destEntry.updatedAt = Date.now();
     return true;
+  }
+
+  // --- Cuckoo Filter Methods ---
+
+  public cfReserve(
+    key: string,
+    capacity: number,
+    bucketSize: number = 2,
+    maxIterations: number = 500,
+    expansion: number = 1,
+  ): boolean {
+    let entry = this.store.get(key);
+    if (entry && !this.isExpired(key, entry)) {
+      throw new Error('ERR item exists');
+    }
+    const filter = new CuckooFilter(capacity, bucketSize, maxIterations, expansion);
+    this.store.set(key, {
+      data: { type: 'Cuckoo---', value: filter },
+      expiresAt: null,
+      createdAt: Date.now(),
+      updatedAt: Date.now(),
+    });
+    this.stats.keysCount++;
+    return true;
+  }
+
+  public cfAdd(key: string, item: string): boolean {
+    let entry = this.store.get(key);
+    if (!entry || this.isExpired(key, entry)) {
+      const filter = new CuckooFilter(1000, 2);
+      filter.add(item);
+      this.store.set(key, {
+        data: { type: 'Cuckoo---', value: filter },
+        expiresAt: null,
+        createdAt: Date.now(),
+        updatedAt: Date.now(),
+      });
+      this.stats.keysCount++;
+      return true;
+    }
+    if (entry.data.type !== 'Cuckoo---') {
+      throw new WrongTypeError();
+    }
+    const filter = entry.data.value as CuckooFilter;
+    const added = filter.add(item);
+    entry.updatedAt = Date.now();
+    return added;
+  }
+
+  public cfAddNx(key: string, item: string): boolean {
+    let entry = this.store.get(key);
+    if (!entry || this.isExpired(key, entry)) {
+      const filter = new CuckooFilter(1000, 2);
+      filter.add(item);
+      this.store.set(key, {
+        data: { type: 'Cuckoo---', value: filter },
+        expiresAt: null,
+        createdAt: Date.now(),
+        updatedAt: Date.now(),
+      });
+      this.stats.keysCount++;
+      return true;
+    }
+    if (entry.data.type !== 'Cuckoo---') {
+      throw new WrongTypeError();
+    }
+    const filter = entry.data.value as CuckooFilter;
+    const added = filter.addNx(item);
+    if (added) {
+      entry.updatedAt = Date.now();
+    }
+    return added;
+  }
+
+  public cfInsert(
+    key: string,
+    items: string[],
+    capacity: number = 1000,
+    noCreate: boolean = false,
+  ): boolean[] {
+    let entry = this.store.get(key);
+    if (!entry || this.isExpired(key, entry)) {
+      if (noCreate) {
+        throw new Error('ERR not found');
+      }
+      const filter = new CuckooFilter(capacity, 2);
+      const results: boolean[] = [];
+      for (const item of items) {
+        results.push(filter.add(item));
+      }
+      this.store.set(key, {
+        data: { type: 'Cuckoo---', value: filter },
+        expiresAt: null,
+        createdAt: Date.now(),
+        updatedAt: Date.now(),
+      });
+      this.stats.keysCount++;
+      return results;
+    }
+    if (entry.data.type !== 'Cuckoo---') {
+      throw new WrongTypeError();
+    }
+    const filter = entry.data.value as CuckooFilter;
+    const results: boolean[] = [];
+    for (const item of items) {
+      results.push(filter.add(item));
+    }
+    entry.updatedAt = Date.now();
+    return results;
+  }
+
+  public cfExists(key: string, item: string): boolean {
+    let entry = this.store.get(key);
+    if (!entry || this.isExpired(key, entry)) return false;
+    if (entry.data.type !== 'Cuckoo---') throw new WrongTypeError();
+    return (entry.data.value as CuckooFilter).exists(item);
+  }
+
+  public cfMExists(key: string, items: string[]): boolean[] {
+    let entry = this.store.get(key);
+    if (!entry || this.isExpired(key, entry)) {
+      return items.map(() => false);
+    }
+    if (entry.data.type !== 'Cuckoo---') throw new WrongTypeError();
+    const filter = entry.data.value as CuckooFilter;
+    return items.map((it) => filter.exists(it));
+  }
+
+  public cfDel(key: string, item: string): boolean {
+    let entry = this.store.get(key);
+    if (!entry || this.isExpired(key, entry)) return false;
+    if (entry.data.type !== 'Cuckoo---') throw new WrongTypeError();
+    const filter = entry.data.value as CuckooFilter;
+    const deleted = filter.delete(item);
+    if (deleted) {
+      entry.updatedAt = Date.now();
+    }
+    return deleted;
+  }
+
+  public cfCount(key: string, item: string): number {
+    let entry = this.store.get(key);
+    if (!entry || this.isExpired(key, entry)) return 0;
+    if (entry.data.type !== 'Cuckoo---') throw new WrongTypeError();
+    return (entry.data.value as CuckooFilter).countOccurrences(item);
+  }
+
+  public cfInfo(key: string): CuckooInfo {
+    let entry = this.store.get(key);
+    if (!entry || this.isExpired(key, entry)) {
+      throw new Error('ERR not found');
+    }
+    if (entry.data.type !== 'Cuckoo---') throw new WrongTypeError();
+    return (entry.data.value as CuckooFilter).info();
   }
 }
