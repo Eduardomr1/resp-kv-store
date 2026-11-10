@@ -203,7 +203,8 @@ export class TCPServer {
     'ZADD', 'ZINCRBY', 'ZREM', 'ZPOPMIN', 'ZPOPMAX', 'ZMPOP',
     'EXPIRE', 'PEXPIRE', 'EXPIREAT', 'PEXPIREAT', 'PERSIST',
     'FLUSHALL', 'FLUSHDB', 'XADD', 'SETBIT', 'BITOP', 'PFADD', 'PFMERGE',
-    'BF.RESERVE', 'BF.ADD', 'BF.MADD', 'CMS.INITBYDIM', 'CMS.INITBYPROB', 'CMS.INCRBY', 'CMS.MERGE'
+    'BF.RESERVE', 'BF.ADD', 'BF.MADD', 'CMS.INITBYDIM', 'CMS.INITBYPROB', 'CMS.INCRBY', 'CMS.MERGE',
+    'CF.RESERVE', 'CF.ADD', 'CF.ADDNX', 'CF.INSERT', 'CF.DEL'
   ]);
 
   private static parseStrictInt(raw: string): number | null {
@@ -1871,6 +1872,227 @@ export class TCPServer {
             return RESP_CONSTANTS.OK;
           } catch (err: any) {
             this.lastCommandMutated = false;
+            return RESPSerializer.encodeError(err.message);
+          }
+        }
+
+        // =======================
+        // CUCKOO FILTER (CF)
+        // =======================
+        case 'CF.RESERVE': {
+          if (args.length < 3) {
+            this.lastCommandMutated = false;
+            return RESPSerializer.encodeError("wrong number of arguments for 'cf.reserve' command");
+          }
+          const key = (args[1] as any).value.toString('utf8');
+          const capacity = Number((args[2] as any).value.toString('utf8'));
+          if (!Number.isInteger(capacity) || capacity <= 0) {
+            this.lastCommandMutated = false;
+            return RESPSerializer.encodeError('ERR capacity must be a positive integer');
+          }
+
+          let bucketSize = 2;
+          let maxIterations = 500;
+          let expansion = 1;
+
+          for (let i = 3; i < args.length; i += 2) {
+            const opt = (args[i] as any).value.toString('utf8').toUpperCase();
+            if (i + 1 >= args.length) {
+              this.lastCommandMutated = false;
+              return RESPSerializer.encodeError('ERR syntax error in CF.RESERVE');
+            }
+            const val = Number((args[i + 1] as any).value.toString('utf8'));
+            if (!Number.isInteger(val) || val <= 0) {
+              this.lastCommandMutated = false;
+              return RESPSerializer.encodeError(`ERR ${opt} must be a positive integer`);
+            }
+            if (opt === 'BUCKETSIZE') bucketSize = val;
+            else if (opt === 'MAXITERATIONS') maxIterations = val;
+            else if (opt === 'EXPANSION') expansion = val;
+            else {
+              this.lastCommandMutated = false;
+              return RESPSerializer.encodeError(`ERR unknown option ${opt}`);
+            }
+          }
+
+          try {
+            this.engine.cfReserve(key, capacity, bucketSize, maxIterations, expansion);
+            return RESP_CONSTANTS.OK;
+          } catch (err: any) {
+            this.lastCommandMutated = false;
+            return RESPSerializer.encodeError(err.message);
+          }
+        }
+
+        case 'CF.ADD': {
+          if (args.length !== 3) {
+            this.lastCommandMutated = false;
+            return RESPSerializer.encodeError("wrong number of arguments for 'cf.add' command");
+          }
+          const key = (args[1] as any).value.toString('utf8');
+          const item = (args[2] as any).value.toString('utf8');
+          try {
+            this.engine.cfAdd(key, item);
+            return RESPSerializer.encodeInteger(1);
+          } catch (err: any) {
+            this.lastCommandMutated = false;
+            return RESPSerializer.encodeError(err.message);
+          }
+        }
+
+        case 'CF.ADDNX': {
+          if (args.length !== 3) {
+            this.lastCommandMutated = false;
+            return RESPSerializer.encodeError("wrong number of arguments for 'cf.addnx' command");
+          }
+          const key = (args[1] as any).value.toString('utf8');
+          const item = (args[2] as any).value.toString('utf8');
+          try {
+            const added = this.engine.cfAddNx(key, item);
+            return RESPSerializer.encodeInteger(added ? 1 : 0);
+          } catch (err: any) {
+            this.lastCommandMutated = false;
+            return RESPSerializer.encodeError(err.message);
+          }
+        }
+
+        case 'CF.INSERT': {
+          if (args.length < 4) {
+            this.lastCommandMutated = false;
+            return RESPSerializer.encodeError("wrong number of arguments for 'cf.insert' command");
+          }
+          const key = (args[1] as any).value.toString('utf8');
+          let capacity = 1000;
+          let noCreate = false;
+          let itemsIdx = -1;
+
+          for (let i = 2; i < args.length; i++) {
+            const token = (args[i] as any).value.toString('utf8').toUpperCase();
+            if (token === 'CAPACITY') {
+              if (i + 1 >= args.length) {
+                this.lastCommandMutated = false;
+                return RESPSerializer.encodeError('ERR syntax error in CF.INSERT');
+              }
+              capacity = Number((args[++i] as any).value.toString('utf8'));
+            } else if (token === 'NOCREATE') {
+              noCreate = true;
+            } else if (token === 'ITEMS') {
+              itemsIdx = i + 1;
+              break;
+            }
+          }
+
+          if (itemsIdx === -1 || itemsIdx >= args.length) {
+            this.lastCommandMutated = false;
+            return RESPSerializer.encodeError('ERR syntax error, missing ITEMS');
+          }
+
+          const items: string[] = [];
+          for (let i = itemsIdx; i < args.length; i++) {
+            items.push((args[i] as any).value.toString('utf8'));
+          }
+
+          try {
+            const results = this.engine.cfInsert(key, items, capacity, noCreate);
+            return RESPSerializer.encodeArray(results.map((r) => (r ? 1 : 0)));
+          } catch (err: any) {
+            this.lastCommandMutated = false;
+            return RESPSerializer.encodeError(err.message);
+          }
+        }
+
+        case 'CF.EXISTS': {
+          if (args.length !== 3) {
+            this.lastCommandMutated = false;
+            return RESPSerializer.encodeError("wrong number of arguments for 'cf.exists' command");
+          }
+          this.lastCommandMutated = false;
+          const key = (args[1] as any).value.toString('utf8');
+          const item = (args[2] as any).value.toString('utf8');
+          try {
+            const exists = this.engine.cfExists(key, item);
+            return RESPSerializer.encodeInteger(exists ? 1 : 0);
+          } catch (err: any) {
+            return RESPSerializer.encodeError(err.message);
+          }
+        }
+
+        case 'CF.MEXISTS': {
+          if (args.length < 3) {
+            this.lastCommandMutated = false;
+            return RESPSerializer.encodeError("wrong number of arguments for 'cf.mexists' command");
+          }
+          this.lastCommandMutated = false;
+          const key = (args[1] as any).value.toString('utf8');
+          const items = args.slice(2).map((a: any) => a.value.toString('utf8'));
+          try {
+            const results = this.engine.cfMExists(key, items);
+            return RESPSerializer.encodeArray(results.map((r) => (r ? 1 : 0)));
+          } catch (err: any) {
+            return RESPSerializer.encodeError(err.message);
+          }
+        }
+
+        case 'CF.DEL': {
+          if (args.length !== 3) {
+            this.lastCommandMutated = false;
+            return RESPSerializer.encodeError("wrong number of arguments for 'cf.del' command");
+          }
+          const key = (args[1] as any).value.toString('utf8');
+          const item = (args[2] as any).value.toString('utf8');
+          try {
+            const deleted = this.engine.cfDel(key, item);
+            return RESPSerializer.encodeInteger(deleted ? 1 : 0);
+          } catch (err: any) {
+            this.lastCommandMutated = false;
+            return RESPSerializer.encodeError(err.message);
+          }
+        }
+
+        case 'CF.COUNT': {
+          if (args.length !== 3) {
+            this.lastCommandMutated = false;
+            return RESPSerializer.encodeError("wrong number of arguments for 'cf.count' command");
+          }
+          this.lastCommandMutated = false;
+          const key = (args[1] as any).value.toString('utf8');
+          const item = (args[2] as any).value.toString('utf8');
+          try {
+            const count = this.engine.cfCount(key, item);
+            return RESPSerializer.encodeInteger(count);
+          } catch (err: any) {
+            return RESPSerializer.encodeError(err.message);
+          }
+        }
+
+        case 'CF.INFO': {
+          if (args.length !== 2) {
+            this.lastCommandMutated = false;
+            return RESPSerializer.encodeError("wrong number of arguments for 'cf.info' command");
+          }
+          this.lastCommandMutated = false;
+          const key = (args[1] as any).value.toString('utf8');
+          try {
+            const info = this.engine.cfInfo(key);
+            return RESPSerializer.encodeArray([
+              'Size',
+              info.size,
+              'Number of buckets',
+              info.numBuckets,
+              'Number of filters',
+              info.numFilters,
+              'Number of items inserted',
+              info.numItemsInserted,
+              'Number of items deleted',
+              info.numItemsDeleted,
+              'Bucket size',
+              info.bucketSize,
+              'Expansion rate',
+              info.expansion,
+              'Max iterations',
+              info.maxIterations,
+            ]);
+          } catch (err: any) {
             return RESPSerializer.encodeError(err.message);
           }
         }
