@@ -204,7 +204,8 @@ export class TCPServer {
     'EXPIRE', 'PEXPIRE', 'EXPIREAT', 'PEXPIREAT', 'PERSIST',
     'FLUSHALL', 'FLUSHDB', 'XADD', 'SETBIT', 'BITOP', 'PFADD', 'PFMERGE',
     'BF.RESERVE', 'BF.ADD', 'BF.MADD', 'CMS.INITBYDIM', 'CMS.INITBYPROB', 'CMS.INCRBY', 'CMS.MERGE',
-    'CF.RESERVE', 'CF.ADD', 'CF.ADDNX', 'CF.INSERT', 'CF.DEL'
+    'CF.RESERVE', 'CF.ADD', 'CF.ADDNX', 'CF.INSERT', 'CF.DEL',
+    'TOPK.RESERVE', 'TOPK.ADD', 'TOPK.INCRBY'
   ]);
 
   private static parseStrictInt(raw: string): number | null {
@@ -2091,6 +2092,182 @@ export class TCPServer {
               info.expansion,
               'Max iterations',
               info.maxIterations,
+            ]);
+          } catch (err: any) {
+            return RESPSerializer.encodeError(err.message);
+          }
+        }
+
+        // =======================
+        // TOP-K HEAVYKEEPER (TOPK)
+        // =======================
+        case 'TOPK.RESERVE': {
+          if (args.length !== 3 && args.length !== 6) {
+            this.lastCommandMutated = false;
+            return RESPSerializer.encodeError("wrong number of arguments for 'topk.reserve' command");
+          }
+          const key = (args[1] as any).value.toString('utf8');
+          const k = TCPServer.parseStrictInt((args[2] as any).value.toString('utf8'));
+          if (k === null || k <= 0) {
+            this.lastCommandMutated = false;
+            return RESPSerializer.encodeError('ERR k must be a positive integer');
+          }
+
+          let width = 8;
+          let depth = 7;
+          let decay = 0.9;
+
+          if (args.length === 6) {
+            const parsedWidth = TCPServer.parseStrictInt((args[3] as any).value.toString('utf8'));
+            const parsedDepth = TCPServer.parseStrictInt((args[4] as any).value.toString('utf8'));
+            const parsedDecay = Number((args[5] as any).value.toString('utf8'));
+            if (parsedWidth === null || parsedWidth <= 0) {
+              this.lastCommandMutated = false;
+              return RESPSerializer.encodeError('ERR width must be a positive integer');
+            }
+            if (parsedDepth === null || parsedDepth <= 0) {
+              this.lastCommandMutated = false;
+              return RESPSerializer.encodeError('ERR depth must be a positive integer');
+            }
+            if (!Number.isFinite(parsedDecay) || parsedDecay <= 0 || parsedDecay > 1) {
+              this.lastCommandMutated = false;
+              return RESPSerializer.encodeError('ERR decay must be in (0, 1]');
+            }
+            width = parsedWidth;
+            depth = parsedDepth;
+            decay = parsedDecay;
+          }
+
+          try {
+            this.engine.topkReserve(key, k, width, depth, decay);
+            return RESP_CONSTANTS.OK;
+          } catch (err: any) {
+            this.lastCommandMutated = false;
+            return RESPSerializer.encodeError(err.message);
+          }
+        }
+
+        case 'TOPK.ADD': {
+          if (args.length < 3) {
+            this.lastCommandMutated = false;
+            return RESPSerializer.encodeError("wrong number of arguments for 'topk.add' command");
+          }
+          const key = (args[1] as any).value.toString('utf8');
+          const items = args.slice(2).map((a: any) => a.value.toString('utf8'));
+          try {
+            const evicted = this.engine.topkAdd(key, items);
+            return RESPSerializer.encodeArray(evicted);
+          } catch (err: any) {
+            this.lastCommandMutated = false;
+            return RESPSerializer.encodeError(err.message);
+          }
+        }
+
+        case 'TOPK.INCRBY': {
+          if (args.length < 4 || (args.length - 2) % 2 !== 0) {
+            this.lastCommandMutated = false;
+            return RESPSerializer.encodeError("wrong number of arguments for 'topk.incrby' command");
+          }
+          const key = (args[1] as any).value.toString('utf8');
+          const entries: Array<{ item: string; increment: number }> = [];
+          for (let i = 2; i < args.length; i += 2) {
+            const item = (args[i] as any).value.toString('utf8');
+            const inc = TCPServer.parseStrictInt((args[i + 1] as any).value.toString('utf8'));
+            if (inc === null || inc <= 0) {
+              this.lastCommandMutated = false;
+              return RESPSerializer.encodeError('ERR increment must be a positive integer');
+            }
+            entries.push({ item, increment: inc });
+          }
+          try {
+            const evicted = this.engine.topkIncrBy(key, entries);
+            return RESPSerializer.encodeArray(evicted);
+          } catch (err: any) {
+            this.lastCommandMutated = false;
+            return RESPSerializer.encodeError(err.message);
+          }
+        }
+
+        case 'TOPK.QUERY': {
+          if (args.length < 3) {
+            this.lastCommandMutated = false;
+            return RESPSerializer.encodeError("wrong number of arguments for 'topk.query' command");
+          }
+          this.lastCommandMutated = false;
+          const key = (args[1] as any).value.toString('utf8');
+          const items = args.slice(2).map((a: any) => a.value.toString('utf8'));
+          try {
+            const results = this.engine.topkQuery(key, items);
+            return RESPSerializer.encodeArray(results.map((r) => (r ? 1 : 0)));
+          } catch (err: any) {
+            return RESPSerializer.encodeError(err.message);
+          }
+        }
+
+        case 'TOPK.COUNT': {
+          if (args.length < 3) {
+            this.lastCommandMutated = false;
+            return RESPSerializer.encodeError("wrong number of arguments for 'topk.count' command");
+          }
+          this.lastCommandMutated = false;
+          const key = (args[1] as any).value.toString('utf8');
+          const items = args.slice(2).map((a: any) => a.value.toString('utf8'));
+          try {
+            const counts = this.engine.topkCount(key, items);
+            return RESPSerializer.encodeArray(counts);
+          } catch (err: any) {
+            return RESPSerializer.encodeError(err.message);
+          }
+        }
+
+        case 'TOPK.LIST': {
+          if (args.length !== 2 && args.length !== 3) {
+            this.lastCommandMutated = false;
+            return RESPSerializer.encodeError("wrong number of arguments for 'topk.list' command");
+          }
+          this.lastCommandMutated = false;
+          const key = (args[1] as any).value.toString('utf8');
+          let withCount = false;
+          if (args.length === 3) {
+            const opt = (args[2] as any).value.toString('utf8').toUpperCase();
+            if (opt !== 'WITHCOUNT') {
+              return RESPSerializer.encodeError('ERR syntax error in TOPK.LIST');
+            }
+            withCount = true;
+          }
+          try {
+            const list = this.engine.topkList(key, withCount);
+            if (!withCount) {
+              return RESPSerializer.encodeArray(list as string[]);
+            }
+            const flat: Array<string | number> = [];
+            for (const entry of list as Array<{ item: string; count: number }>) {
+              flat.push(entry.item, entry.count);
+            }
+            return RESPSerializer.encodeArray(flat);
+          } catch (err: any) {
+            return RESPSerializer.encodeError(err.message);
+          }
+        }
+
+        case 'TOPK.INFO': {
+          if (args.length !== 2) {
+            this.lastCommandMutated = false;
+            return RESPSerializer.encodeError("wrong number of arguments for 'topk.info' command");
+          }
+          this.lastCommandMutated = false;
+          const key = (args[1] as any).value.toString('utf8');
+          try {
+            const info = this.engine.topkInfo(key);
+            return RESPSerializer.encodeArray([
+              'k',
+              info.k,
+              'width',
+              info.width,
+              'depth',
+              info.depth,
+              'decay',
+              info.decay.toString(),
             ]);
           } catch (err: any) {
             return RESPSerializer.encodeError(err.message);
