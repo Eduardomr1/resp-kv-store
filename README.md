@@ -231,9 +231,23 @@ Diseñado con estándares de **Systems & Backend Core Engineering**: seguridad b
   - `CF.COUNT key item`: Retorna el número de ocurrencias almacenadas de la huella del elemento.
   - `CF.INFO key`: Retorna metadatos de capacidad, tamaño en bytes, número de buckets, filtros y recuento de inserciones y eliminaciones.
 
-### 20. Diagnóstico de Memoria y Codificación
+### 20. Top-K Heavy Hitters (HeavyKeeper + Min-Heap)
+- Estructura probabilística de flujo continuo para identificar los $k$ elementos más frecuentes (*heavy hitters*) en espacio sublineal $O(d \cdot w + k)$, combinando el algoritmo **HeavyKeeper** con un **Min-Heap** acotado de tamaño $k$ e índice inverso $O(1)$.
+- **Count-with-Exponential-Decay**:
+  - Matriz $d \times w$ de celdas `(fingerprint_32bit, count_32bit)` respaldada por `Uint32Array`.
+  - Ante colisiones de huella, los contadores existentes decaen probabilísticamente según $p = \text{decay}^{\text{count}}$, protegiendo a los *elephants* frecuentes mientras descarta rápidamente el ruido de baja frecuencia (*mice*).
+- Comandos soportados:
+  - `TOPK.RESERVE key topk [width depth decay]`: Inicializa un monitor Top-K (valores por defecto: `width=8`, `depth=7`, `decay=0.9`).
+  - `TOPK.ADD key item [item ...]`: Registra elementos con incremento unitario y retorna un array alineado con el nombre del elemento expulsado del Top-K (o `nil` si no hubo desplazamiento).
+  - `TOPK.INCRBY key item increment [item increment ...]`: Incrementa frecuencias en lote con enteros positivos y retorna los elementos desplazados.
+  - `TOPK.QUERY key item [item ...]`: Verifica en $O(1)$ si cada elemento pertenece actualmente al conjunto Top-K.
+  - `TOPK.COUNT key item [item ...]`: Retorna la frecuencia estimada de cada elemento.
+  - `TOPK.LIST key [WITHCOUNT]`: Lista el Top-K ordenado de forma descendente por frecuencia, con conteos opcionales.
+  - `TOPK.INFO key`: Retorna los parámetros de configuración (`k`, `width`, `depth`, `decay`).
+
+### 21. Diagnóstico de Memoria y Codificación
 - `MEMORY USAGE key`: Estimación de memoria en bytes consumida por una clave y su estructura interna.
-- `OBJECT ENCODING key`: Retorna el tipo de representación interna en memoria (`embstr`, `raw`, `hashtable`, `skiplist`, `quicklist`, `bloomfilter`, `count-min-sketch`, `cuckoofilter`).
+- `OBJECT ENCODING key`: Retorna el tipo de representación interna en memoria (`embstr`, `raw`, `hashtable`, `skiplist`, `quicklist`, `bloomfilter`, `count-min-sketch`, `cuckoofilter`, `topk`).
 - `DBSIZE`: Retorna el número total de claves presentes en la base de datos.
 
 ---
@@ -321,6 +335,14 @@ redis-cli -p 6379 CF.DEL blacklist "bad_ip_192.168.1.1"
 redis-cli -p 6379 CF.EXISTS blacklist "bad_ip_192.168.1.1"
 # Salida: (integer) 0
 
+# Top-K Heavy Hitters (HeavyKeeper)
+redis-cli -p 6379 TOPK.RESERVE trending_endpoints 3 32 5 0.9
+# Salida: OK
+redis-cli -p 6379 TOPK.INCRBY trending_endpoints "/api/auth" 120 "/api/orders" 85 "/api/search" 40
+# Salida: 1) (nil)  2) (nil)  3) (nil)
+redis-cli -p 6379 TOPK.LIST trending_endpoints WITHCOUNT
+# Salida: 1) "/api/auth" 2) (integer) 120 3) "/api/orders" 4) (integer) 85 5) "/api/search" 6) (integer) 40
+
 redis-cli -p 6379 SAVE
 redis-cli -p 6379 INFO
 ```
@@ -329,7 +351,7 @@ redis-cli -p 6379 INFO
 
 ## 🧪 Pruebas Unitarias y de Integración
 
-El proyecto incluye 22 suites de pruebas con **162 pruebas automatizadas** que cubren todas las ramas del sistema:
+El proyecto incluye 24 archivos de pruebas (26 suites) con **171 pruebas automatizadas** que cubren todas las ramas del sistema:
 
 ```bash
 npm test
@@ -357,8 +379,9 @@ npm test
 19. `tests/cms.test.ts`: Count-Min Sketch, convergencia de frecuencias, merges ponderados y telemetría.
 20. `tests/geo.test.ts`: Indexación geoespacial, geohashes de 52 bits y búsqueda por radio geodésico Haversine.
 21. `tests/cuckoo.test.ts`: Cuckoo Filter con hashing de desplazamiento parcial, eliminación dinámica y comandos RESP en vivo.
+22. `tests/topk.test.ts`: Top-K HeavyKeeper (decaimiento exponencial, Min-Heap, ciclo de vida en `StorageEngine`, persistencia/compactación AOF, transacciones OCC y comandos `TOPK.*` en vivo).
 
-**Resultado de ejecución**: `162 pass, 0 fail (100% éxito)`.
+**Resultado de ejecución**: `171 pass, 0 fail (100% éxito)`.
 
 ---
 
@@ -423,13 +446,14 @@ resp-kv-store/
 │   │   ├── rdb_types.ts
 │   │   ├── skiplist.ts
 │   │   ├── stream.ts
+│   │   ├── topk.ts              # Top-K HeavyKeeper con decaimiento exponencial y Min-Heap acotado
 │   │   └── types.ts
 │   ├── telemetry/               # Telemetría de latencia y monitoreo de Slowlog
 │   │   └── slowlog.ts
 │   └── transactions/            # Engine de transacciones MULTI/EXEC y bloqueo optimista WATCH
 │       ├── manager.ts
 │       └── types.ts
-├── tests/                       # 22 suites de pruebas unitarias y de integración (162 tests)
+├── tests/                       # 24 archivos de pruebas unitarias y de integración (171 tests)
 ├── package.json
 └── tsconfig.json
 ```
