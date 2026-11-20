@@ -2,9 +2,12 @@ import { describe, it } from 'node:test';
 import assert from 'node:assert';
 import fs from 'node:fs';
 import path from 'node:path';
+import net from 'node:net';
 import { TopK } from '../src/storage/topk.ts';
 import { StorageEngine } from '../src/storage/engine.ts';
 import { WrongTypeError } from '../src/storage/types.ts';
+import { TCPServer } from '../src/server.ts';
+import { RESPParser } from '../src/resp/parser.ts';
 
 describe('TopK HeavyKeeper Algorithm Suite', () => {
   it('validates configuration parameters and exposes accurate info/byteSize', () => {
@@ -236,6 +239,134 @@ describe('StorageEngine Top-K AOF Persistence & Compaction Suite', () => {
     } finally {
       engine2.close();
       cleanup();
+    }
+  });
+});
+
+describe('Server TCP Top-K Integration Suite', () => {
+  it('executes full suite of TOPK commands, introspection, and transactions over live TCP socket', async () => {
+    const port = 16435;
+    const server = new TCPServer({ port });
+    await server.start();
+
+    const createClient = () => {
+      const socket = net.createConnection({ port, host: '127.0.0.1' });
+      const parser = new RESPParser();
+      const responses: any[] = [];
+      socket.on('data', (chunk) => {
+        parser.feed(chunk);
+        for (const item of parser.parse()) {
+          responses.push(item);
+        }
+      });
+      const send = async (cmds: string[]) => {
+        const target = responses.length + 1;
+        let payload = `*${cmds.length}\r\n`;
+        for (const c of cmds) {
+          payload += `$${Buffer.byteLength(c)}\r\n${c}\r\n`;
+        }
+        socket.write(payload);
+        while (responses.length < target) {
+          await new Promise((r) => setTimeout(r, 5));
+        }
+        return responses[target - 1];
+      };
+      return { socket, send };
+    };
+
+    const client1 = createClient();
+    const client2 = createClient();
+
+    try {
+      // 1. TOPK.RESERVE
+      const r1 = await client1.send(['TOPK.RESERVE', 'api_hits', '3', '32', '5', '0.9']);
+      assert.strictEqual(r1.type, 'simple_string');
+      assert.strictEqual(r1.value, 'OK');
+
+      // Duplicate reserve error
+      const rDup = await client1.send(['TOPK.RESERVE', 'api_hits', '3']);
+      assert.strictEqual(rDup.type, 'error');
+      assert.match(rDup.value, /ERR item exists/);
+
+      // Invalid reserve parameters
+      const rBadDecay = await client1.send(['TOPK.RESERVE', 'bad_tk', '3', '8', '7', '1.5']);
+      assert.strictEqual(rBadDecay.type, 'error');
+
+      // 2. TOPK.ADD (null bulk strings when heap not full)
+      const r2 = await client1.send(['TOPK.ADD', 'api_hits', '/home', '/login', '/cart', '/home']);
+      assert.strictEqual(r2.type, 'array');
+      assert.deepStrictEqual(
+        r2.value.map((v: any) => (v.type === 'null' ? null : v.value.toString('utf8'))),
+        [null, null, null, null]
+      );
+
+      // 3. TOPK.INCRBY (evicts '/login' or '/cart' with count 1)
+      const r3 = await client1.send(['TOPK.INCRBY', 'api_hits', '/checkout', '10', '/home', '5']);
+      assert.strictEqual(r3.type, 'array');
+      const evictedItem = r3.value[0].type === 'null' ? null : r3.value[0].value.toString('utf8');
+      assert.ok(evictedItem === '/login' || evictedItem === '/cart');
+      assert.strictEqual(r3.value[1].type, 'null');
+
+      // 4. TOPK.QUERY & TOPK.COUNT
+      const rQuery = await client1.send(['TOPK.QUERY', 'api_hits', '/checkout', '/home', '/missing']);
+      assert.deepStrictEqual(
+        rQuery.value.map((v: any) => v.value),
+        [1, 1, 0]
+      );
+
+      const rCount = await client1.send(['TOPK.COUNT', 'api_hits', '/checkout', '/home']);
+      assert.deepStrictEqual(
+        rCount.value.map((v: any) => v.value),
+        [10, 7]
+      );
+
+      // 5. TOPK.LIST & TOPK.LIST WITHCOUNT
+      const rList = await client1.send(['TOPK.LIST', 'api_hits']);
+      assert.strictEqual(rList.value[0].value.toString('utf8'), '/checkout');
+      assert.strictEqual(rList.value[1].value.toString('utf8'), '/home');
+
+      const rListWithCount = await client1.send(['TOPK.LIST', 'api_hits', 'WITHCOUNT']);
+      assert.strictEqual(rListWithCount.value.length, 6);
+      assert.strictEqual(rListWithCount.value[0].value.toString('utf8'), '/checkout');
+      assert.strictEqual(rListWithCount.value[1].value, 10);
+      assert.strictEqual(rListWithCount.value[2].value.toString('utf8'), '/home');
+      assert.strictEqual(rListWithCount.value[3].value, 7);
+
+      const rListSyntaxErr = await client1.send(['TOPK.LIST', 'api_hits', 'BADOPT']);
+      assert.strictEqual(rListSyntaxErr.type, 'error');
+
+      // 6. TOPK.INFO
+      const rInfo = await client1.send(['TOPK.INFO', 'api_hits']);
+      const infoMap = rInfo.value.map((v: any) =>
+        Buffer.isBuffer(v.value) ? v.value.toString('utf8') : String(v.value)
+      );
+      assert.deepStrictEqual(infoMap, ['k', '3', 'width', '32', 'depth', '5', 'decay', '0.9']);
+
+      // 7. Introspection: TYPE, OBJECT ENCODING, MEMORY USAGE
+      const rType = await client1.send(['TYPE', 'api_hits']);
+      assert.strictEqual(rType.value, 'TopK-');
+
+      const rEnc = await client1.send(['OBJECT', 'ENCODING', 'api_hits']);
+      assert.strictEqual(rEnc.value.toString('utf8'), 'topk');
+
+      const rMem = await client1.send(['MEMORY', 'USAGE', 'api_hits']);
+      assert.strictEqual(rMem.type, 'integer');
+      assert.ok(rMem.value > 0);
+
+      // 8. Transactions & WATCH OCC integration
+      assert.strictEqual((await client1.send(['WATCH', 'api_hits'])).value, 'OK');
+      assert.strictEqual((await client1.send(['MULTI'])).value, 'OK');
+      assert.strictEqual((await client1.send(['TOPK.ADD', 'api_hits', '/profile'])).value, 'QUEUED');
+
+      // Concurrent mutation by client2 invalidates watched key
+      await client2.send(['TOPK.INCRBY', 'api_hits', '/checkout', '2']);
+
+      const rExecAborted = await client1.send(['EXEC']);
+      assert.strictEqual(rExecAborted.type, 'null'); // Null array *-1\r\n on OCC conflict
+    } finally {
+      client1.socket.destroy();
+      client2.socket.destroy();
+      await server.stop();
     }
   });
 });
