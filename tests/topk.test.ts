@@ -1,5 +1,7 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert';
+import fs from 'node:fs';
+import path from 'node:path';
 import { TopK } from '../src/storage/topk.ts';
 import { StorageEngine } from '../src/storage/engine.ts';
 import { WrongTypeError } from '../src/storage/types.ts';
@@ -170,6 +172,70 @@ describe('StorageEngine Top-K Lifecycle Suite', () => {
       assert.throws(() => engine.topkQuery('ttl_topk', ['k1']), /ERR key does not exist/);
     } finally {
       engine.close();
+    }
+  });
+});
+
+describe('StorageEngine Top-K AOF Persistence & Compaction Suite', () => {
+  const aofPath = path.resolve('./test_topk_appendonly.aof');
+  const cleanup = () => {
+    if (fs.existsSync(aofPath)) {
+      try { fs.unlinkSync(aofPath); } catch {}
+    }
+  };
+
+  it('recovers Top-K state after restart and compacts via AOF rewrite', async () => {
+    cleanup();
+    const engine1 = new StorageEngine({
+      aofEnabled: true,
+      aofFilePath: aofPath,
+      aofFsyncPolicy: 'always',
+    });
+
+    try {
+      engine1.topkReserve('trending', 2, 16, 5, 0.9);
+      for (let i = 0; i < 20; i++) {
+        engine1.topkAdd('trending', ['video_a']);
+      }
+      engine1.topkIncrBy('trending', [
+        { item: 'video_b', increment: 12 },
+        { item: 'video_c', increment: 3 },
+      ]);
+      const bloatedSize = fs.statSync(aofPath).size;
+
+      await engine1.getAOF()!.rewrite(engine1);
+      const compactedSize = fs.statSync(aofPath).size;
+      assert.ok(compactedSize < bloatedSize, `Expected ${compactedSize} < ${bloatedSize}`);
+    } finally {
+      engine1.close();
+    }
+
+    const engine2 = new StorageEngine({
+      aofEnabled: true,
+      aofFilePath: aofPath,
+      aofFsyncPolicy: 'always',
+    });
+
+    try {
+      assert.strictEqual(engine2.type('trending'), 'TopK-');
+      assert.deepStrictEqual(engine2.topkInfo('trending'), {
+        k: 2,
+        width: 16,
+        depth: 5,
+        decay: 0.9,
+      });
+      assert.deepStrictEqual(engine2.topkQuery('trending', ['video_a', 'video_b', 'video_c']), [
+        true,
+        true,
+        false,
+      ]);
+      assert.deepStrictEqual(engine2.topkList('trending', true), [
+        { item: 'video_a', count: 20 },
+        { item: 'video_b', count: 12 },
+      ]);
+    } finally {
+      engine2.close();
+      cleanup();
     }
   });
 });
