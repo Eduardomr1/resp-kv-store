@@ -5,8 +5,9 @@ import type { EvictionPolicy } from '../eviction/types.ts';
 import type { BloomFilter } from './bloom.ts';
 import type { CountMinSketch } from './cms.ts';
 import type { CuckooFilter } from './cuckoo.ts';
+import type { TopK } from './topk.ts';
 
-export type RedisDataType = 'string' | 'hash' | 'list' | 'set' | 'zset' | 'stream' | 'MBbloom--' | 'CMSketch-' | 'Cuckoo---';
+export type RedisDataType = 'string' | 'hash' | 'list' | 'set' | 'zset' | 'stream' | 'MBbloom--' | 'CMSketch-' | 'Cuckoo---' | 'TopK-';
 
 export class WrongTypeError extends Error {
   constructor() {
@@ -61,6 +62,11 @@ export interface CuckooData {
   value: CuckooFilter;
 }
 
+export interface TopKData {
+  type: 'TopK-';
+  value: TopK;
+}
+
 export type StorageData =
   | StringData
   | HashData
@@ -70,7 +76,8 @@ export type StorageData =
   | StreamData
   | BloomData
   | CMSData
-  | CuckooData;
+  | CuckooData
+  | TopKData;
 
 export interface StorageEntry {
   data: StorageData;

@@ -18,6 +18,7 @@ import {
 import { BloomFilter } from './bloom.ts';
 import { CountMinSketch, type CMSInfo } from './cms.ts';
 import { CuckooFilter, type CuckooInfo } from './cuckoo.ts';
+import { TopK, type TopKInfo, type TopKListEntry } from './topk.ts';
 import {
   type StorageEntry,
   type StorageData,
@@ -2371,6 +2372,8 @@ export class StorageEngine {
         return (data.value as CountMinSketch).byteSize;
       case 'Cuckoo---':
         return (data.value as CuckooFilter).byteSize;
+      case 'TopK-':
+        return (data.value as TopK).byteSize;
       default:
         return 0;
     }
@@ -2598,6 +2601,8 @@ export class StorageEngine {
         return 'count-min-sketch';
       case 'Cuckoo---':
         return 'cuckoofilter';
+      case 'TopK-':
+        return 'topk';
       default:
         return 'raw';
     }
@@ -2856,5 +2861,100 @@ export class StorageEngine {
     }
     if (entry.data.type !== 'Cuckoo---') throw new WrongTypeError();
     return (entry.data.value as CuckooFilter).info();
+  }
+
+  // --- Top-K HeavyKeeper Methods ---
+
+  private getTopKEntry(key: string): { entry: StorageEntry; topk: TopK } {
+    const entry = this.store.get(key);
+    if (!entry || this.isExpired(key, entry)) {
+      throw new Error('ERR key does not exist');
+    }
+    if (entry.data.type !== 'TopK-') {
+      throw new WrongTypeError();
+    }
+    return { entry, topk: entry.data.value as TopK };
+  }
+
+  public topkReserve(
+    key: string,
+    k: number,
+    width: number = 8,
+    depth: number = 7,
+    decay: number = 0.9,
+  ): boolean {
+    const existing = this.store.get(key);
+    if (existing && !this.isExpired(key, existing)) {
+      throw new Error('ERR item exists');
+    }
+    const topk = new TopK(k, width, depth, decay);
+    const data: StorageData = { type: 'TopK-', value: topk };
+    this.trackMemoryEstimate(key, data);
+
+    try {
+      this.memoryGovernor.evictIfNeeded();
+    } catch (err) {
+      this.reclaimMemoryEstimate(key, data);
+      throw err;
+    }
+
+    const now = Date.now();
+    this.store.set(key, {
+      data,
+      expiresAt: null,
+      createdAt: now,
+      updatedAt: now,
+      lastAccessTime: now,
+      lfuCounter: LFU_INIT_VAL,
+      lfuDecayTime: now,
+    });
+    return true;
+  }
+
+  public topkAdd(key: string, items: string[]): (string | null)[] {
+    const { entry, topk } = this.getTopKEntry(key);
+    this.reclaimMemoryEstimate(key, entry.data);
+    const evicted = topk.add(items);
+    this.trackMemoryEstimate(key, entry.data);
+    entry.updatedAt = Date.now();
+    this.recordAccess(entry);
+    return evicted;
+  }
+
+  public topkIncrBy(
+    key: string,
+    items: Array<{ item: string; increment: number }>,
+  ): (string | null)[] {
+    const { entry, topk } = this.getTopKEntry(key);
+    this.reclaimMemoryEstimate(key, entry.data);
+    const evicted = topk.incrBy(items);
+    this.trackMemoryEstimate(key, entry.data);
+    entry.updatedAt = Date.now();
+    this.recordAccess(entry);
+    return evicted;
+  }
+
+  public topkQuery(key: string, items: string[]): boolean[] {
+    const { entry, topk } = this.getTopKEntry(key);
+    this.recordAccess(entry);
+    return topk.query(items);
+  }
+
+  public topkCount(key: string, items: string[]): number[] {
+    const { entry, topk } = this.getTopKEntry(key);
+    this.recordAccess(entry);
+    return topk.count(items);
+  }
+
+  public topkList(key: string, withCount = false): Array<string | TopKListEntry> {
+    const { entry, topk } = this.getTopKEntry(key);
+    this.recordAccess(entry);
+    return topk.list(withCount);
+  }
+
+  public topkInfo(key: string): TopKInfo {
+    const { entry, topk } = this.getTopKEntry(key);
+    this.recordAccess(entry);
+    return topk.info();
   }
 }
