@@ -2199,6 +2199,27 @@ export class StorageEngine {
         fields.push([args[i].toString('utf8'), args[i + 1]]);
       }
       this.xadd(key, id, fields);
+    } else if (cmd === 'TOPK.RESERVE' && args.length >= 3) {
+      const key = args[1].toString('utf8');
+      const k = Number(args[2].toString('utf8'));
+      const width = args.length >= 6 ? Number(args[3].toString('utf8')) : 8;
+      const depth = args.length >= 6 ? Number(args[4].toString('utf8')) : 7;
+      const decay = args.length >= 6 ? Number(args[5].toString('utf8')) : 0.9;
+      this.topkReserve(key, k, width, depth, decay);
+    } else if (cmd === 'TOPK.ADD' && args.length >= 3) {
+      const key = args[1].toString('utf8');
+      const items = args.slice(2).map((b) => b.toString('utf8'));
+      this.topkAdd(key, items);
+    } else if (cmd === 'TOPK.INCRBY' && args.length >= 4) {
+      const key = args[1].toString('utf8');
+      const pairs: Array<{ item: string; increment: number }> = [];
+      for (let i = 2; i + 1 < args.length; i += 2) {
+        pairs.push({
+          item: args[i].toString('utf8'),
+          increment: Number(args[i + 1].toString('utf8')),
+        });
+      }
+      this.topkIncrBy(key, pairs);
     } else if (cmd === 'FLUSHALL') {
       this.flushall();
     }
@@ -2256,6 +2277,28 @@ export class StorageEngine {
               flatFields.push(k, v);
             }
             commands.push(['XADD', key, sEntry.id, ...flatFields]);
+          }
+          break;
+        }
+
+        case 'TopK-': {
+          const topk = entry.data.value as TopK;
+          const info = topk.info();
+          commands.push([
+            'TOPK.RESERVE',
+            key,
+            info.k.toString(),
+            info.width.toString(),
+            info.depth.toString(),
+            info.decay.toString(),
+          ]);
+          const items = topk.list(true) as TopKListEntry[];
+          if (items.length > 0) {
+            const flat: string[] = [];
+            for (const entryItem of items) {
+              flat.push(entryItem.item, entryItem.count.toString());
+            }
+            commands.push(['TOPK.INCRBY', key, ...flat]);
           }
           break;
         }
@@ -2908,6 +2951,14 @@ export class StorageEngine {
       lfuCounter: LFU_INIT_VAL,
       lfuDecayTime: now,
     });
+    this.logAOF([
+      'TOPK.RESERVE',
+      key,
+      k.toString(),
+      width.toString(),
+      depth.toString(),
+      decay.toString(),
+    ]);
     return true;
   }
 
@@ -2918,6 +2969,9 @@ export class StorageEngine {
     this.trackMemoryEstimate(key, entry.data);
     entry.updatedAt = Date.now();
     this.recordAccess(entry);
+    if (items.length > 0) {
+      this.logAOF(['TOPK.ADD', key, ...items]);
+    }
     return evicted;
   }
 
@@ -2931,6 +2985,13 @@ export class StorageEngine {
     this.trackMemoryEstimate(key, entry.data);
     entry.updatedAt = Date.now();
     this.recordAccess(entry);
+    if (items.length > 0) {
+      const flat: string[] = [];
+      for (const { item, increment } of items) {
+        flat.push(item, increment.toString());
+      }
+      this.logAOF(['TOPK.INCRBY', key, ...flat]);
+    }
     return evicted;
   }
 
